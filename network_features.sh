@@ -313,8 +313,8 @@ _create_argo_node() {
     else domain=$(_start_argo_tunnel "$port" "${protocol}-${transport}") || return 1; [ -n "$domain" ] || return 1; fi
     meta=$(jq -n --arg t "$tag" --arg p "${protocol}-${transport}" --argjson port "$port" --arg c "$credential" --arg proto "$protocol" \
         --arg path "$path" --arg n "$name" --arg d "$domain" --arg mode "$mode" --arg token "$token" --arg core "$core" '
-        {($t):{name:$n,protocol:$p,local_port:$port,path:$path,domain:$d,type:$mode,token:$token,core:$core}
-            + if $proto == "vless" then {uuid:$c} else {password:$c} end}') || return 1
+        {($t): ({name:$n,protocol:$p,local_port:$port,path:$path,domain:$d,type:$mode,token:$token,core:$core}
+            + (if $proto == "vless" then {uuid:$c} else {password:$c} end))}') || return 1
     [ -f "$ARGO_METADATA_FILE" ] || printf '{}\n' > "$ARGO_METADATA_FILE"
     _atomic_modify_json "$ARGO_METADATA_FILE" '. + $meta' --argjson meta "$meta" || return 1
     _argo_refresh_artifacts "$tag" && _enable_argo_watchdog || return 1
