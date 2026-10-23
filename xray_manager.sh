@@ -4,8 +4,16 @@ umask 077
 # xray_manager.sh — Xray-core 节点管理子脚本
 # 与 singbox.sh 共存，共享 clash.yaml
 # ============================================================
-XRAY_SCRIPT_VERSION="3.1.3"
+XRAY_SCRIPT_VERSION="3.2.0"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+if ! declare -f _get_client_address >/dev/null 2>&1; then
+    _get_client_address() {
+        local domain
+        domain=$(jq -r '.domain // empty' "${SINGBOX_DIR:-/usr/local/etc/sing-box}/domain.json" 2>/dev/null)
+        if [ -n "$domain" ]; then printf '%s\n' "$domain"; else _get_public_ip; fi
+    }
+fi
 
 # --- 路径定义 ---
 XRAY_BIN="/usr/local/bin/xray"
@@ -241,6 +249,7 @@ _ensure_xray_dependencies() {
 # --- Xray 专用原子 JSON 修改 ---
 _xray_atomic_modify_json() {
         local file="$1" filter="$2"
+        shift 2
         [ ! -f "$file" ] && return 1
         local tmp tmp_stub
         # Xray 新版本会按文件扩展名识别配置格式；候选配置必须保留 .json
@@ -253,7 +262,7 @@ _xray_atomic_modify_json() {
             rm -f -- "$tmp_stub"
             return 1
         fi
-        if ! jq "$filter" "$file" > "$tmp" || ! jq empty "$tmp" >/dev/null 2>&1; then
+        if ! jq "$@" "$filter" "$file" > "$tmp" || ! jq empty "$tmp" >/dev/null 2>&1; then
             _error "修改JSON失败: $file"
             rm -f -- "$tmp"
             return 1
@@ -828,6 +837,20 @@ EOF
     local sensitive_file
     for sensitive_file in "$XRAY_DIR"/*.key; do [ -f "$sensitive_file" ] && chmod 600 "$sensitive_file"; done
     for sensitive_file in "$XRAY_DIR"/*.pem; do [ -f "$sensitive_file" ] && chmod 644 "$sensitive_file"; done
+    # 后安装/独立启动 Xray 时继承主脚本保存的统一 SOCKS5 出口。
+    if [ -f "${SINGBOX_DIR}/egress.json" ]; then
+        local egress
+        egress=$(jq -c '.outbound' "${SINGBOX_DIR}/egress.json") || return 1
+        if [ "$egress" != null ]; then
+            _xray_atomic_modify_json "$XRAY_CONFIG" '
+                .outbounds = ((.outbounds // [] | map(select(.tag != "managed-socks-egress"))) +
+                    [{tag:"managed-socks-egress",protocol:"socks",settings:{servers:[{address:$o.server,port:$o.server_port}
+                        + if ($o.username // "") != "" then {users:[{user:$o.username,pass:$o.password}]} else {} end]}}])
+                | .routing.rules = ([{type:"field",network:"tcp,udp",outboundTag:"managed-socks-egress"}]
+                    + ((.routing.rules // []) | map(select(.outboundTag != "managed-socks-egress"))))
+            ' --argjson o "$egress" || return 1
+        fi
+    fi
     return 0
 }
 
@@ -908,6 +931,10 @@ _view_xray_log() {
 }
 
 _uninstall_xray() {
+    if [ -f "${SINGBOX_DIR}/argo_metadata.json" ] && jq -e 'any(.[]; .core == "xray")' "${SINGBOX_DIR}/argo_metadata.json" >/dev/null 2>&1; then
+        _error "存在由 Xray 承载的 Argo 节点，请先在 Argo 菜单删除这些节点。"
+        return 1
+    fi
     echo ""
     _warn "即将卸载 Xray 核心及其所有配置！"
     read -p "$(echo -e ${RED}"确定要卸载吗? (输入 yes 确认): "${NC})" confirm
@@ -1041,7 +1068,7 @@ _save_xray_meta() {
 # ============================================================
 
 _add_vless_reality_vision() {
-    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    [ -z "$server_ip" ] && server_ip=$(_get_client_address)
     local node_ip="$server_ip"
     
     read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
@@ -1104,7 +1131,7 @@ _add_vless_reality_vision() {
 # ============================================================
 
 _add_vless_grpc_reality() {
-    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    [ -z "$server_ip" ] && server_ip=$(_get_client_address)
     local node_ip="$server_ip"
     
     read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
@@ -1160,7 +1187,7 @@ _add_vless_grpc_reality() {
 # ============================================================
 
 _add_trojan_xhttp_reality() {
-    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    [ -z "$server_ip" ] && server_ip=$(_get_client_address)
     local node_ip="$server_ip"
     
     read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
@@ -1211,7 +1238,7 @@ _add_trojan_xhttp_reality() {
 # ============================================================
 
 _add_trojan_grpc_reality() {
-    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    [ -z "$server_ip" ] && server_ip=$(_get_client_address)
     local node_ip="$server_ip"
     
     read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
@@ -1281,7 +1308,7 @@ _generate_xray_shadowsocks_password() {
 }
 
 _add_shadowsocks_xray() {
-    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    [ -z "$server_ip" ] && server_ip=$(_get_client_address)
     local node_ip="$server_ip"
     
     clear
@@ -1405,7 +1432,7 @@ _add_shadowsocks_xray() {
 # ============================================================
 
 _add_vless_h2_tls() {
-    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    [ -z "$server_ip" ] && server_ip=$(_get_client_address)
     local node_ip="$server_ip"
     
     read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
@@ -1491,7 +1518,7 @@ _add_vless_h2_tls() {
 # ============================================================
 
 _add_xray_vless_grpc_tls() {
-    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    [ -z "$server_ip" ] && server_ip=$(_get_client_address)
     local node_ip="$server_ip"
     
     read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
@@ -1575,7 +1602,7 @@ _add_xray_vless_grpc_tls() {
 # ============================================================
 
 _add_trojan_grpc_tls() {
-    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    [ -z "$server_ip" ] && server_ip=$(_get_client_address)
     local node_ip="$server_ip"
     
     read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
@@ -1696,7 +1723,7 @@ _view_xray_nodes() {
 }
 
 _delete_xray_node() {
-    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '.inbounds | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
+    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '.inbounds | map(select((.tag | startswith("argo-")) | not)) | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
         _warn "当前没有 Xray 节点可删除。"; return
     fi
     [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
@@ -1713,7 +1740,7 @@ _delete_xray_node() {
         local i=${#tags[@]}
         echo -e "  ${GREEN}[${i}]${NC} ${name} (端口: ${port})"
     done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
-        .inbounds[] |
+        .inbounds[] | select((.tag | startswith("argo-")) | not) |
         . as $in |
         ($meta[0][$in.tag] // {}) as $m |
         [$in.tag, ($in.port|tostring), ($m.name // $in.tag)] | @tsv
@@ -1735,7 +1762,7 @@ _delete_xray_node() {
     _xray_snapshot_state || { _error "无法创建变更快照。"; return 1; }
     local snapshot="$XRAY_TX_DIR"
     if { [ -z "$target_name" ] || [ "$target_name" = "null" ] || _xray_remove_node_from_yaml "$target_name" "$target_port"; } && \
-       _xray_atomic_modify_json "$XRAY_CONFIG" "del(.inbounds[] | select(.tag == \"$target_tag\"))" && \
+       _xray_atomic_modify_json "$XRAY_CONFIG" "del(.inbounds[] | select((.tag | startswith("argo-")) | not) | select(.tag == \"$target_tag\"))" && \
        _xray_atomic_modify_json "$XRAY_METADATA" "del(.\"$target_tag\")" && \
        _manage_xray_service restart; then
         rm -f -- "${XRAY_DIR}/${target_tag}.pem" "${XRAY_DIR}/${target_tag}.key"
@@ -1751,10 +1778,10 @@ _delete_xray_node() {
 }
 
 _delete_all_xray_nodes() {
-    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '.inbounds | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
+    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '.inbounds | map(select((.tag | startswith("argo-")) | not)) | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
         _warn "当前没有 Xray 节点。"; return
     fi
-    local count=$(jq '.inbounds | length' "$XRAY_CONFIG")
+    local count=$(jq '.inbounds | map(select((.tag | startswith("argo-")) | not)) | length' "$XRAY_CONFIG")
     read -p "$(echo -e ${RED}"确定删除全部 ${count} 个节点? (y/N): "${NC})" confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { _info "已取消。"; return; }
     _xray_snapshot_state || { _error "无法创建变更快照。"; return 1; }
@@ -1762,12 +1789,12 @@ _delete_all_xray_nodes() {
     while IFS=$'\t' read -r tag port name; do
         if [ -n "$name" ] && ! _xray_remove_node_from_yaml "$name" "$port"; then cleanup_ok=0; fi
     done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
-        .inbounds[] | [.tag, (.port|tostring), ($meta[0][.tag].name // .tag)] | @tsv' "$XRAY_CONFIG" 2>/dev/null)
+        .inbounds[] | select((.tag | startswith("argo-")) | not) | [.tag, (.port|tostring), ($meta[0][.tag].name // .tag)] | @tsv' "$XRAY_CONFIG" 2>/dev/null)
     if [ "$cleanup_ok" -eq 1 ] && \
-       _xray_atomic_modify_json "$XRAY_CONFIG" '.inbounds = []' && \
+       _xray_atomic_modify_json "$XRAY_CONFIG" '.inbounds |= map(select(.tag | startswith("argo-")))' && \
        _xray_atomic_modify_json "$XRAY_METADATA" '{} ' && \
        _manage_xray_service restart; then
-        for tag in $(jq -r '.inbounds[].tag' "$snapshot/config.json" 2>/dev/null); do
+        for tag in $(jq -r '.inbounds[] | select((.tag | startswith("argo-")) | not) | .tag' "$snapshot/config.json" 2>/dev/null); do
             rm -f -- "${XRAY_DIR}/${tag}.pem" "${XRAY_DIR}/${tag}.key"
         done
         _xray_drop_snapshot "$snapshot"
@@ -1782,7 +1809,7 @@ _delete_all_xray_nodes() {
 }
 
 _modify_xray_port() {
-    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '.inbounds | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
+    if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '.inbounds | map(select((.tag | startswith("argo-")) | not)) | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
         _warn "当前没有 Xray 节点。"; return
     fi
     [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
@@ -1799,7 +1826,7 @@ _modify_xray_port() {
         local i=${#tags[@]}
         echo -e "  ${GREEN}[${i}]${NC} ${name} (端口: ${port})"
     done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
-        .inbounds[] |
+        .inbounds[] | select((.tag | startswith("argo-")) | not) |
         . as $in |
         ($meta[0][$in.tag] // {}) as $m |
         [$in.tag, ($in.port|tostring), ($m.name // $in.tag)] | @tsv
@@ -1826,7 +1853,7 @@ _modify_xray_port() {
     fi
     _xray_snapshot_state || { _error "无法创建变更快照。"; return 1; }
     local snapshot="$XRAY_TX_DIR" change_ok=1
-    _xray_atomic_modify_json "$XRAY_CONFIG" "(.inbounds[] | select(.tag == \"$target_tag\") | .port) = $new_port" || change_ok=0
+    _xray_atomic_modify_json "$XRAY_CONFIG" "(.inbounds[] | select((.tag | startswith("argo-")) | not) | select(.tag == \"$target_tag\") | .port) = $new_port" || change_ok=0
     if [ "$change_ok" -eq 1 ] && [ -n "$target_name" ] && [ "$target_name" != "null" ] && [ -f "$CLASH_YAML_FILE" ]; then
         export MOD_NAME="$target_name" MOD_PORT="$old_port" NEW_NAME="$new_name" NEW_PORT="$new_port"
         _xray_atomic_modify_yaml "$CLASH_YAML_FILE" '
@@ -1900,13 +1927,15 @@ _xray_add_node_menu() {
 }
 
 _initialize_xray_runtime() {
-    local listen_fix_status
+    local listen_fix_status config_before config_after
+    config_before=$(jq -cS . "$XRAY_CONFIG" 2>/dev/null || true)
     _init_xray_config || return 1
+    config_after=$(jq -cS . "$XRAY_CONFIG") || return 1
     _ensure_xray_clash_yaml || return 1
     _create_xray_service || return 1
     _check_and_fix_xray_listen
     listen_fix_status=$?
-    if [ "$listen_fix_status" -eq 0 ]; then
+    if [ "$listen_fix_status" -eq 0 ] || [ "$config_before" != "$config_after" ]; then
         _manage_xray_service "restart" || return 1
     elif [ "$listen_fix_status" -gt 1 ]; then
         return 1
@@ -1987,4 +2016,4 @@ _xray_menu() {
 # ============================================================
 #                       入口
 # ============================================================
-_xray_menu
+if [[ "${SINGBOXLITE_LIBRARY_ONLY:-0}" != 1 ]]; then _xray_menu; fi

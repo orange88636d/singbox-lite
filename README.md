@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v28`、`advanced_relay.sh v19`、`xray_manager.sh v3.1.3`。
+当前文档按以下脚本版本整理：`singbox.sh v29`、`advanced_relay.sh v19`、`xray_manager.sh v3.2.0`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -14,6 +14,7 @@
 | `advanced_relay.sh` | 落地/中转、第三方节点导入、端口转发和规则管理 |
 | `parser.sh` | 第三方节点链接的严格解析器，通常由中转脚本调用 |
 | `xray_manager.sh` | Xray-core 安装、服务和节点管理，与主脚本共享 `clash.yaml` |
+| `network_features.sh` | 域名绑定、双核心 SOCKS5 出口、Argo 扩展和订阅管理，由主入口加载 |
 
 ## 主要能力
 
@@ -21,6 +22,8 @@
 - 节点创建、查看、删除、端口修改、批量创建和分享链接输出。
 - VLESS、Trojan、Hysteria2、TUIC、AnyTLS、Shadowsocks、SOCKS5 等协议管理。
 - VLESS-WS / Trojan-WS 的 Argo 临时隧道和固定隧道。
+- Argo 支持 VLESS/Trojan 的 WebSocket、HTTPUpgrade 和 XHTTP（Xray）传输。
+- 连接域名绑定、双核心统一 SOCKS5 出口，以及订阅导入、更新、导出和实时 HTTP 订阅。
 - 支持本机节点 Token 与第三方落地节点两种接入流程，并可选择四种中转入口协议。
 - nftables 内核转发与 sing-box 用户态转发双引擎，按实际权限自动选择。
 - IPv4/IPv6 地址、域名目标、TCP、UDP、TCP+UDP 端口转发。
@@ -47,8 +50,19 @@
 
 ## 安装与启动
 
+本地修改版请将五个脚本一起部署。在本仓库的 `singbox-lite-main` 目录中执行：
+
 ```bash
-(curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
+sudo install -d -m 700 /usr/local/etc/sing-box
+sudo install -m 755 singbox.sh /usr/local/bin/sb
+sudo install -m 755 advanced_relay.sh parser.sh xray_manager.sh network_features.sh /usr/local/etc/sing-box/
+sudo sb
+```
+
+推送到 [orange88636d/singbox-lite](https://github.com/orange88636d/singbox-lite) 后，可通过下面的命令在线安装：
+
+```bash
+(curl -LfsS https://raw.githubusercontent.com/orange88636d/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/orange88636d/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
 ```
 
 以后直接运行：
@@ -66,7 +80,7 @@ sb
 
 固定版锁定状态会显示在主菜单的 sing-box 版本旁。固定版和最新版都会校验官方发布标签、资产名称、SHA-256 摘要、二进制实际版本以及现有 `config.json + relay.json` 组合配置；任一步失败都不会提交新核心。
 
-子脚本缺失时，主脚本会从同一仓库下载，并在覆盖或执行前检查 HTTPS 来源、非空内容、Bash shebang 和语法。
+子脚本缺失时，主脚本会从同一仓库下载，并在覆盖或执行前检查 HTTPS 来源、非空内容、Bash shebang 和语法。网络模块也需与主脚本保持配套，脚本更新会预下载五个组件并统一提交。
 
 ## 主菜单
 
@@ -91,9 +105,56 @@ sb
 |  | 17 | 卸载脚本 |
 | 进阶功能 | 18 | 落地/中转/第三方节点导入/端口转发 |
 |  | 19 | Xray 节点管理 |
+|  | 20 | 绑定默认连接域名、已有节点或 Argo 固定隧道域名 |
+|  | 21 | 双核心统一 SOCKS5 出口 |
+|  | 22 | 添加/更新订阅、选择订阅节点中转、导出与发布本机订阅 |
 | 退出 | 0 | 退出脚本 |
 
 `[5] 修改节点` 会按实际协议显示可用项目。所有主节点均可修改名称、客户端连接地址、端口和认证信息；Reality 可更新伪装域名并轮换密钥，TLS 类节点可更新 SNI、自签证书或自定义证书，WebSocket/gRPC 可修改传输路径，Hysteria2 还可调整混淆、端口跳跃和客户端带宽。保存时会统一校验 sing-box 配置并同步元数据、分享链接与 Clash/Mihomo 配置，失败则自动回滚。
+
+## 域名绑定与统一出口
+
+主菜单 `[20]` 可设置后续 sing-box/Xray 节点的默认连接域名，也可给已有节点更换连接域名并同步分享链接和 YAML。普通节点需要自行将 DNS A/AAAA 指向服务器；连接地址与 TLS SNI、证书分别管理，脚本不会改写 Reality 伪装域名或自动签发证书。
+
+Argo 固定隧道支持更换绑定域名；须同时在 Cloudflare Dashboard 将 Public Hostname 配置为该域名，Service 指向脚本显示的 `http://localhost:本地端口`。临时隧道不能绑定自定义域名，应改用 Token 固定隧道。
+
+主菜单 `[21]` 支持无认证或用户名/密码认证的 SOCKS5 上游，包括 IPv4、IPv6 和域名地址。启用后，sing-box 与 Xray 使用最高优先级路由，将核心接收的 TCP/UDP 代理流量统一送到该出口；上游不可达时不会自动回退直连。原有分流和中转配置被保留，关闭统一出口后重新生效。后安装的核心初始化时也会读取这份出口设置。
+
+UDP 需要 SOCKS5 上游支持 UDP ASSOCIATE。此功能不接管操作系统自身流量、DNS/NTP 等核心控制连接、cloudflared 连接或 nftables DNAT；要让原来的 nftables 转发也经过出口，应先在端口转发菜单将其切换为 sing-box 用户态引擎。
+
+## Argo 传输选项
+
+主菜单 `[2]` 中：`[1]/[2]` 为 VLESS/Trojan WebSocket，`[8]` 为 XHTTP，`[9]` 为 HTTPUpgrade，后两项均可选 VLESS 或 Trojan。内部监听仅绑定 `127.0.0.1`；WS 与 HTTPUpgrade 使用 sing-box，XHTTP 使用 Xray，需先安装对应核心。临时/固定隧道、重启、自动守护、删除和域名同步均使用同一份 Argo 元数据。
+
+XHTTP 默认使用 `packet-up`，服务端与分享链接保持一致。XHTTP、HTTPUpgrade 输出 URI，建议使用支持该传输的 Xray 客户端；它们不会混入共享 Mihomo YAML。WebSocket 继续输出 Mihomo 配置并支持 Early Data。
+
+`httpupdate` 按 HTTPUpgrade 实现。gRPC TLS 保留在 Argo 菜单 `[10]` 作为直连/CDN 回源入口；[Cloudflare 官方说明](https://developers.cloudflare.com/cloudflare-one/faq/cloudflare-tunnels-faq/#does-cloudflare-tunnel-support-grpc)指出，公网 Tunnel hostname 不支持 gRPC，因此不会创建声称可用的公网 Argo gRPC 隧道。
+
+## 订阅管理
+
+主菜单 `[22]` 提供：
+
+1. 添加 HTTP(S) 订阅，支持原始 URI 列表、Base64（包括 URL-safe 编码）及常见 Clash/Mihomo `proxies` YAML。
+2. 手动更新或删除订阅。下载失败、格式损坏或全部节点无效时保留旧订阅；导入前按当前 sing-box 核心逐个检查，显示有效及跳过数量，相同节点去重。
+3. 从订阅节点创建本机中转，沿用原来的入口协议、端口检查和配置事务。也可选择其中的 SOCKS5 节点作为双核心统一出口。
+4. 导出本机所有已保存的分享链接、聚合 Base64 与共享 Clash YAML。
+5. 按需安装 Python 3，提供带随机访问 Token 的实时订阅 HTTP 服务。
+
+URI 支持 VLESS TCP/WS/gRPC/HTTPUpgrade（TLS、Reality 或纯 TCP 的有效组合）、Trojan、AnyTLS、Hysteria2、SOCKS5、HTTP(S) 和七种常见 Shadowsocks 算法。Clash YAML 支持上述协议的常见字段；VMess、TUIC、XHTTP、插件、部分证书固定参数及其他扩展不会被猜测转换。不受支持或未通过核心检查的节点会跳过。本机 XHTTP 等节点仍可通过导出的 URI 订阅供支持的客户端使用。
+
+订阅更新刷新的是节点池；已创建的中转和已选定的统一出口保持当前配置。需要切换时重新选择节点。单个订阅上限为 4 MiB、500 个节点，下载验证系统 CA，不关闭 TLS 校验。
+
+HTTP 服务默认监听 `127.0.0.1:18080`，可通过已有 HTTPS 反向代理或单独的 Cloudflare Public Hostname 发布。设置访问基址后会显示：
+
+```text
+https://sub.example.com/<随机Token>/base64
+https://sub.example.com/<随机Token>/links
+https://sub.example.com/<随机Token>/clash
+```
+
+也可显式选择 `0.0.0.0` 开放 HTTP 监听。订阅 URL 包含节点凭据，应妥善保存；公网使用建议配置 HTTPS。服务仅接受上述三个端点，不提供目录浏览。每次请求在共享锁下读取最新元数据，节点修改、删除及临时 Argo 域名变化会实时反映到订阅；请求路径不会写入日志。systemd/OpenRC 支持开机启动，direct 环境使用独立 cron 守护，可在同一菜单停止并禁用。
+
+本机导出文件位于 `/usr/local/etc/sing-box/subscription-export/`，是执行导出时的快照；实时 URL 不依赖该快照。
 
 ## sing-box 节点协议
 
@@ -245,6 +306,11 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 | `/usr/local/etc/sing-box/relay.json` | 中转和用户态端口转发配置 |
 | `/usr/local/etc/sing-box/clash.yaml` | sing-box/Xray 共享客户端配置 |
 | `/usr/local/etc/sing-box/metadata.json` | 主节点元数据和分享链接 |
+| `/usr/local/etc/sing-box/argo_metadata.json` | Argo 节点、所属核心、域名与 Tunnel Token |
+| `/usr/local/etc/sing-box/domain.json` | 新节点默认连接域名 |
+| `/usr/local/etc/sing-box/egress.json` | 统一 SOCKS5 出口配置 |
+| `/usr/local/etc/sing-box/subscriptions.json` | 订阅 URL 与导入节点池 |
+| `/usr/local/etc/sing-box/subscription-http.json` | 订阅 HTTP 监听地址和访问 Token |
 | `/usr/local/etc/sing-box/core-version.lock` | 固定版 `1.13.21` 的持久升级锁 |
 | `/usr/local/etc/sing-box/relay.d/` | 中转、端口转发和辅助状态 |
 | `/usr/local/etc/xray/config.json` | Xray 服务端配置 |
@@ -266,7 +332,25 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 - VLESS/Trojan 等可能由 Xray 核心运行的自签 TLS 分享链接优先输出 `pcs` 固定证书，不再同时输出新版 Xray 已拒绝的 `insecure` 参数。普通 AnyTLS 由 sing-box 核心运行；v2rayN 7.24.9 导入分享链接时虽读取 `pcs`，生成 sing-box 出站时却不应用它，因此默认自签证书的 AnyTLS 链接使用 `insecure=1`，与 Clash YAML 的 `skip-cert-verify: true` 一致。该方式会跳过证书身份验证；需要验证身份时请使用自有域名与受信任证书，或继续使用 Any-Reality。
 - 第三方解析器只输出最小允许 schema，中转脚本会再次校验字段和值。
 
+## 开发验证
+
+需要 Bash、jq、yq、Python 3 以及两个核心。在项目目录运行：
+
+```bash
+SB_TEST_BIN=/path/to/sing-box XRAY_TEST_BIN=/path/to/xray YQ_TEST_BIN=/path/to/yq bash tests/network_features.sh
+bash tests/http_config.sh
+```
+
+可通过 `PYTHON_TEST_BIN` 指定 Python 可执行文件，默认 `python3`。测试数据写入临时目录，服务管理与 cloudflared 使用替身；配置检查使用真实核心，另通过回环 SOCKS 服务验证出口优先级及故障时不回退直连。订阅 HTTP 测试检查 Token、端点限制和实时刷新。在 Windows 上执行时，仅将 HTTP 测试中的 POSIX 文件锁替换为测试替身；Linux 服务启动、实际 UDP 转发和 Cloudflare 公网隧道仍需在目标环境验证。
+
 ## 更新日志
+
+### 2026.10.24
+
+- 新增默认/已有节点域名绑定、Argo 固定域名切换和双核心统一 SOCKS5 出口。
+- Argo 新增 XHTTP、HTTPUpgrade，可选 VLESS/Trojan；gRPC 保持直连/CDN 回源模式。
+- 新增订阅 URL 导入、更新、删除、节点池选择中转、SOCKS5 出口选择，以及聚合文件和带 Token 的实时 HTTP 订阅。
+- 跨核心改动使用共享锁、配置验证和失败回滚；cloudflared 不再继承管理事务锁。Argo 由所属菜单统一管理，Xray 普通删除/端口菜单保留 Argo 入口。
 
 以下记录保留项目历次主要修改。早期条目描述的是当时实现；如果与当前功能不同，应以前文的当前支持范围为准。
 

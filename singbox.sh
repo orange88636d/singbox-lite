@@ -6,16 +6,16 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="28"
+export SCRIPT_VERSION="29"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
-SELF_SCRIPT_PATH="$(readlink -f "$0")"
+SELF_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_FIXED_VERSION="1.13.21"
 SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/orange88636d/singbox-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
 # --- 核心工具函数 ---
@@ -86,7 +86,8 @@ _secure_state_permissions() {
     for path in \
         "$CONFIG_FILE" "$CLASH_YAML_FILE" "$METADATA_FILE" "$ARGO_METADATA_FILE" \
         "${SINGBOX_DIR}/relay.json" "${SINGBOX_DIR}/relay_links.json" \
-        "${SINGBOX_DIR}/relay_pf.json" "$SINGBOX_CORE_LOCK_FILE" "/usr/local/etc/xray/config.json" \
+        "${SINGBOX_DIR}/relay_pf.json" "${SINGBOX_DIR}/domain.json" "${SINGBOX_DIR}/egress.json" \
+        "${SINGBOX_DIR}/subscriptions.json" "${SINGBOX_DIR}/subscription-http.json" "${SINGBOX_DIR}/subscription_server.py" "$SINGBOX_CORE_LOCK_FILE" "/usr/local/etc/xray/config.json" \
         "/usr/local/etc/xray/metadata.json"; do
         [ -f "$path" ] && chmod 600 "$path" 2>/dev/null || true
     done
@@ -186,7 +187,7 @@ _get_public_ip() {
     server_ip="$ip"
     echo "$ip"
 }
-_get_ip() { _get_public_ip; } # 别名兼容
+_get_ip() { _get_client_address; } # 别名兼容
 
 # 系统环境检测
 _detect_init_system() {
@@ -544,13 +545,13 @@ _remove_nftables_rules() {
 
 # 公网 IP 初始化
 _init_server_ip() {
-    _info "正在获取服务器公网 IP..."
-    server_ip=$(_get_public_ip)
+    _info "正在获取客户端连接地址..."
+    server_ip=$(_get_client_address)
     if [ -z "$server_ip" ] || [ "$server_ip" == "null" ]; then
         _warn "自动获取 IP 失败，将回退到 127.0.0.1"
         server_ip="127.0.0.1"
     else
-        _success "当前服务器公网 IP: ${server_ip}"
+        _success "当前客户端连接地址: ${server_ip}"
     fi
 }
 
@@ -1876,7 +1877,7 @@ _start_argo_tunnel() {
         
         # 强制锁定 protocol http2 (h2)，防止 QUIC (UDP) 被阻断导致连接失败
         # 增加 --no-autoupdate 防止在精简系统上因自更新导致的意外进程挂起
-        nohup "${CLOUDFLARED_BIN}" tunnel --protocol http2 --no-autoupdate run --token "$token" > "${log_file}" 2>&1 &
+        nohup "${CLOUDFLARED_BIN}" tunnel --protocol http2 --no-autoupdate run --token "$token" > "${log_file}" 2>&1 7>&- 8>&- 9>&- 219>&- &
             
         local cf_pid=$!
         printf '%s\n' "$cf_pid" > "${pid_file}"
@@ -1902,7 +1903,7 @@ _start_argo_tunnel() {
         # 优化：强制指定 http2 协议并禁用自动更新
         nohup "${CLOUDFLARED_BIN}" tunnel --protocol http2 --no-autoupdate --url "http://127.0.0.1:${target_port}" \
             --logfile "${log_file}" \
-            > /dev/null 2>&1 &
+            > /dev/null 2>&1 7>&- 8>&- 9>&- 219>&- &
         
         local cf_pid=$!
         printf '%s\n' "$cf_pid" > "${pid_file}"
@@ -2047,314 +2048,7 @@ _stop_all_argo_tunnels() {
 # 统一 Argo 节点创建函数 (消除 VLESS/Trojan 重复代码)
 # 参数: $1 = 协议类型 ("vless" 或 "trojan")
 # ============================================================
-_add_argo_node() {
-    local protocol="$1"
-    local protocol_label=""
-    local proto_name=""
-    case "$protocol" in
-        vless) protocol_label="VLESS-WS"; proto_name="Vless" ;;
-        trojan) protocol_label="Trojan-WS"; proto_name="Trojan" ;;
-        *) _error "不支持的 Argo 协议: $protocol"; return 1 ;;
-    esac
-
-    _info "--- 创建 ${protocol_label} + Argo 隧道节点 ---"
-
-    # 安装 cloudflared
-    _install_cloudflared || return 1
-
-    # === [公共] 内部端口分配 ===
-    read -p "请输入 Argo 内部监听端口 (回车随机生成): " input_port
-    local port="$input_port"
-
-    while true; do
-        if [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; then
-            _check_port_conflict "$port" "tcp" && port="" && continue
-            _info "已使用监听端口: ${port}"
-            break
-        else
-            [ -n "$port" ] && _warning "端口格式无效，将重新生成..."
-            # 使用内建算法生成随机端口 (10000-60000)，移除 shuf 依赖
-            port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 50001 + 10000 ))
-            _info "正在尝试分配随机内部端口: ${port}..."
-        fi
-    done
-
-    # === [公共] WebSocket 路径 ===
-    read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
-    if [ -z "$ws_path" ]; then
-        ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
-        _info "已生成随机路径: ${ws_path}"
-    else
-        [[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
-    fi
-
-    # === [协议特定] Trojan 密码输入 ===
-    local password=""
-    if [ "$protocol" == "trojan" ]; then
-        read -p "请输入 Trojan 密码 (回车随机生成): " password
-        if [ -z "$password" ]; then
-            password=$(${SINGBOX_BIN} generate rand --hex 16)
-            _info "已生成随机密码: ${password}"
-        fi
-    fi
-
-    # === [公共] 隧道模式选择 ===
-    echo ""
-    echo "请选择隧道模式:"
-    echo "  1. 临时隧道 (无需配置, 随机域名, 不稳定，重启失效)"
-    echo "  2. 固定隧道 (需 Token, 自定义域名, 稳定持久，重启不失效)"
-    read -p "请选择 [1/2] (默认: 1): " tunnel_mode
-    tunnel_mode=${tunnel_mode:-1}
-
-    local token=""
-    local tunnel_domain=""
-    local argo_type="temp"
-
-    if [ "$tunnel_mode" == "2" ]; then
-        argo_type="fixed"
-        _info "您选择了 [固定隧道] 模式。"
-        echo ""
-        _info "请粘贴 Cloudflare Tunnel Token (支持直接粘贴CF网页端所给出的任何安装命令):"
-        read -p "Token: " input_token
-        # 自动提取 Token
-        token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' | head -1)
-        if [ -z "$token" ]; then
-             token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]{20,}' | head -1)
-        fi
-        if [ -z "$token" ]; then
-             token="$input_token"
-        fi
-
-        if [ -z "$token" ]; then _error "Token 不能为空"; return 1; fi
-        _info "已识别 Token (前20位): ${token:0:20}..."
-
-        echo ""
-        _info "请输入该 Tunnel 绑定的域名 (用于生成客户端配置):"
-        read -p "域名 (例如 tunnel.example.com): " input_domain
-        if [ -z "$input_domain" ]; then _error "域名不能为空"; return 1; fi
-        tunnel_domain="$input_domain"
-
-        echo ""
-        _info "【重要提示】请务必去 Cloudflare Dashboard 配置该 Tunnel 的 Public Hostname:"
-        _info "  Public Hostname: ${tunnel_domain}"
-        _info "  Service: http://localhost:${port}"
-        echo ""
-        read -n 1 -s -r -p "确认配置无误后，按任意键继续..."
-        echo ""
-    else
-        _info "您选择了 [临时隧道] 模式。"
-    fi
-
-    # === [公共] 节点名称 ===
-    local default_prefix="Argo-Temp"
-    if [ "$argo_type" == "fixed" ]; then
-        default_prefix="Argo-Fixed"
-    fi
-    local default_name="${default_prefix}-${proto_name}-${port}"
-
-    echo ""
-    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
-    local name=${custom_name:-$default_name}
-
-    # === [协议特定] 生成凭据、tag 和 Inbound ===
-    local tag="argo-${protocol}-ws-${port}"
-    local uuid=""
-    local inbound_json=""
-
-    if [ "$protocol" == "vless" ]; then
-        uuid=$(${SINGBOX_BIN} generate uuid)
-        inbound_json=$(jq -n \
-            --arg t "$tag" \
-            --arg p "$port" \
-            --arg u "$uuid" \
-            --arg wsp "$ws_path" \
-            --argjson ed "$WS_EARLY_DATA_SIZE" \
-            --arg edh "$WS_EARLY_DATA_HEADER" \
-            '{
-                "type": "vless",
-                "tag": $t,
-                "listen": "127.0.0.1",
-                "listen_port": ($p|tonumber),
-                "users": [{"uuid": $u, "flow": ""}],
-                "transport": {
-                    "type": "ws",
-                    "path": $wsp,
-                    "max_early_data": $ed,
-                    "early_data_header_name": $edh
-                }
-            }')
-    elif [ "$protocol" == "trojan" ]; then
-        inbound_json=$(jq -n \
-            --arg t "$tag" \
-            --arg p "$port" \
-            --arg pw "$password" \
-            --arg wsp "$ws_path" \
-            --argjson ed "$WS_EARLY_DATA_SIZE" \
-            --arg edh "$WS_EARLY_DATA_HEADER" \
-            '{
-                "type": "trojan",
-                "tag": $t,
-                "listen": "127.0.0.1",
-                "listen_port": ($p|tonumber),
-                "users": [{"password": $pw}],
-                "transport": {
-                    "type": "ws",
-                    "path": $wsp,
-                    "max_early_data": $ed,
-                    "early_data_header_name": $edh
-                }
-            }')
-    fi
-
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
-
-    # === [公共] 重启 + 启动隧道 ===
-    _manage_service "restart"
-    sleep 2
-
-    if [ "$argo_type" == "fixed" ]; then
-        if ! _start_argo_tunnel "$port" "${protocol}-ws" "$token"; then
-             _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
-             _manage_service "restart"
-             return 1
-        fi
-    else
-        local real_domain=$(_start_argo_tunnel "$port" "${protocol}-ws")
-        if [ -z "$real_domain" ] || [ "$real_domain" == "" ]; then
-            _error "隧道启动失败，正在回滚配置..."
-            _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
-            _manage_service "restart"
-            return 1
-        fi
-        tunnel_domain="$real_domain"
-    fi
-
-    # === [协议特定] 保存元数据 ===
-    local credential_key="" credential_val=""
-    if [ "$protocol" == "vless" ]; then
-        credential_key="uuid"; credential_val="$uuid"
-    else
-        credential_key="password"; credential_val="$password"
-    fi
-
-    local argo_meta=$(jq -n \
-        --arg tag "$tag" \
-        --arg name "$name" \
-        --arg domain "$tunnel_domain" \
-        --arg port "$port" \
-        --arg cred_val "$credential_val" \
-        --arg cred_key "$credential_key" \
-        --arg path "$ws_path" \
-        --arg protocol "${protocol}-ws" \
-        --arg type "$argo_type" \
-        --arg token "$token" \
-        --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
-        '{($tag): {name: $name, domain: $domain, local_port: ($port|tonumber), ($cred_key): $cred_val, path: $path, protocol: $protocol, type: $type, token: $token, created_at: $created}}')
-
-    if [ ! -f "$ARGO_METADATA_FILE" ]; then
-        echo '{}' > "$ARGO_METADATA_FILE"
-    fi
-    _atomic_modify_json "$ARGO_METADATA_FILE" ". + $argo_meta"
-
-    # === [协议特定] Clash 配置 + 分享链接 ===
-    local proxy_json=""
-    if [ "$protocol" == "vless" ]; then
-        proxy_json=$(jq -n \
-            --arg n "$name" \
-            --arg s "$tunnel_domain" \
-            --arg u "$uuid" \
-            --arg wsp "$ws_path" \
-            --argjson ed "$WS_EARLY_DATA_SIZE" \
-            --arg edh "$WS_EARLY_DATA_HEADER" \
-            '{
-                "name": $n,
-                "type": "vless",
-                "server": $s,
-                "port": 443,
-                "uuid": $u,
-                "tls": true,
-                "udp": true,
-                "skip-cert-verify": false,
-                "network": "ws",
-                "servername": $s,
-                "ws-opts": {
-                    "path": $wsp,
-                    "max-early-data": $ed,
-                    "early-data-header-name": $edh,
-                    "headers": {
-                        "Host": $s
-                    }
-                }
-            }')
-    elif [ "$protocol" == "trojan" ]; then
-        proxy_json=$(jq -n \
-            --arg n "$name" \
-            --arg s "$tunnel_domain" \
-            --arg pw "$password" \
-            --arg wsp "$ws_path" \
-            --argjson ed "$WS_EARLY_DATA_SIZE" \
-            --arg edh "$WS_EARLY_DATA_HEADER" \
-            '{
-                "name": $n,
-                "type": "trojan",
-                "server": $s,
-                "port": 443,
-                "password": $pw,
-                "udp": true,
-                "skip-cert-verify": false,
-                "network": "ws",
-                "sni": $s,
-                "ws-opts": {
-                    "path": $wsp,
-                    "max-early-data": $ed,
-                    "early-data-header-name": $edh,
-                    "headers": {
-                        "Host": $s
-                    }
-                }
-            }')
-    fi
-
-    if ! _add_node_to_yaml "$proxy_json"; then
-        _stop_argo_tunnel "$port"
-        _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag" >/dev/null 2>&1 || true
-        _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    # === [公共] 启用守护 + 显示结果 ===
-    # 守护是 Argo 节点的完整性条件；失败时回滚本次节点，避免产生
-    # 表面创建成功但重启后无法自愈的半成品状态。
-    if ! _enable_argo_watchdog; then
-        _stop_argo_tunnel "$port"
-        _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag" >/dev/null 2>&1 || true
-        _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
-        _remove_node_from_yaml "$name" >/dev/null 2>&1 || true
-        _manage_service "restart" >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    echo ""
-    _success "${protocol_label} + Argo 节点创建成功!"
-    echo "-------------------------------------------"
-    echo -e "节点名称: ${GREEN}${name}${NC}"
-    echo -e "隧道类型: ${CYAN}${argo_type}${NC}"
-    echo -e "隧道域名: ${CYAN}${tunnel_domain}${NC}"
-    echo -e "本地端口: ${port}"
-    echo "-------------------------------------------"
-    
-    # 使用统一链接生成器进行展示与持久化
-    if [ "$protocol" == "vless" ]; then
-        _show_node_link "vless-ws" "$name" "$tunnel_domain" "443" "$tag" "$uuid" "$ws_path"
-    else
-        _show_node_link "trojan-ws" "$name" "$tunnel_domain" "443" "$tag" "$password" "$ws_path"
-    fi
-    
-    echo "-------------------------------------------"
-    if [ "$argo_type" == "temp" ]; then
-        _warning "注意: 临时隧道每次重启域名会变化！"
-    fi
-}
+# Argo 创建函数由 network_features.sh 提供，覆盖双核心事务与多种传输。
 
 # 保留原始函数名作为薄包装器，确保向后兼容
 _add_argo_vless_ws() { _add_argo_node "vless"; }
@@ -2425,76 +2119,8 @@ _view_argo_nodes() {
         echo "-------------------------------------------"
     done
     
-    echo -e "${YELLOW}提示: 请使用 [9] 重启隧道 来刷新所有节点状态或获取新临时域名。${NC}"
+    echo -e "${YELLOW}提示: 请使用 [7] 重启隧道 来刷新所有节点状态或获取新临时域名。${NC}"
     echo "==================================================="
-}
-
-_delete_argo_node() {
-    if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE")" -eq 0 ]; then
-        _warning "没有 Argo 隧道节点可删除。"
-        return
-    fi
-    
-    _info "--- 删除 Argo 隧道节点 ---"
-    
-    # 读取所有节点到数组
-    local i=1
-    local keys=()
-    local names=()
-    local ports=()
-    
-    # 必须使用 while read 处理 process substitution 避免子 shell 问题
-    while IFS='|' read -r key name port; do
-        keys+=("$key")
-        names+=("$name")
-        ports+=("$port")
-        echo -e " ${CYAN}$i)${NC} ${name} (端口: $port)"
-        ((i++))
-    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)"' "$ARGO_METADATA_FILE")
-    
-    if [ ${#keys[@]} -eq 0 ]; then
-         _warning "读取元数据失败。"
-         return
-    fi
-
-    echo " 0) 返回"
-    read -p "请选择要删除的节点: " choice
-    
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt "${#keys[@]}" ]; then
-        _error "无效输入"
-        return
-    fi
-    
-    if [ "$choice" -eq 0 ]; then return; fi
-    
-    local idx=$((choice - 1))
-    local selected_key="${keys[$idx]}"
-    local selected_name="${names[$idx]}"
-    local selected_port="${ports[$idx]}"
-    
-    _info "正在删除节点: ${selected_name} (端口: ${selected_port})..."
-    
-    # 1. 停止该节点的隧道进程
-    _stop_argo_tunnel "$selected_port"
-    
-    # 2. 从 sing-box 配置文件中移除 inbound
-    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$selected_key\"))"
-    
-    # 3. 删除 Argo 元数据
-    _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$selected_key"
-    
-    # 4. 删除 Clash 配置
-    _remove_node_from_yaml "$selected_name"
-    
-    # 5. 检查是否还有节点，如果没有则禁用守护进程
-    if [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
-        _disable_argo_watchdog
-    fi
-
-    # 6. 重启 sing-box
-    _manage_service "restart"
-    
-    _success "节点 ${selected_name} 已删除！"
 }
 
 _stop_argo_menu() {
@@ -2535,117 +2161,9 @@ _stop_argo_menu() {
     _stop_argo_tunnel "$selected_port"
 }
 
-_restart_argo_tunnel_menu() {
-    _info "--- 重启 Argo 隧道 ---"
-    
-     if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE")" -eq 0 ]; then
-        _warning "没有 Argo 隧道节点。"
-        return
-    fi
-
-    # 选择逻辑
-    local i=1
-    local keys=()
-    local names=()
-    local ports=()
-    local protocols=()
-    local types=()
-    local tokens=()
-    
-    while IFS='|' read -r key name port proto type token; do
-        keys+=("$key")
-        names+=("$name")
-        ports+=("$port")
-        protocols+=("$proto")
-        types+=("$type")
-        tokens+=("$token")
-        echo -e " ${CYAN}$i)${NC} ${name} (端口: $port)"
-        ((i++))
-    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)|\(.value.protocol)|\(.value.type)|\(.value.token)"' "$ARGO_METADATA_FILE")
-    
-    echo " a) 重启所有节点"
-    echo " 0) 返回"
-    read -p "请选择: " choice
-    
-    local selected_indices=()
-    if [ "$choice" == "a" ]; then
-        # 生成所有索引
-        for ((j=0; j<${#keys[@]}; j++)); do selected_indices+=("$j"); done
-    elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -gt 0 ] && [ "$choice" -le "${#keys[@]}" ]; then
-        selected_indices+=($((choice - 1)))
-    else
-        if [ "$choice" -ne 0 ]; then _error "无效输入"; fi
-        return
-    fi
-
-    # 增强参数提取，为同步链接做准备
-    local names=() ports=() protocols=() types=() tokens=() tags=() uuids=() passwords=() paths=()
-    while IFS='|' read -r key name port proto type token uuid pw path; do
-        tags+=("$key")
-        names+=("$name")
-        ports+=("$port")
-        protocols+=("$proto")
-        types+=("$type")
-        tokens+=("$token")
-        uuids+=("$uuid")
-        passwords+=("$pw")
-        paths+=("$path")
-    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)|\(.value.protocol)|\(.value.type)|\(.value.token // "")|\(.value.uuid // "")|\(.value.password // "")|\(.value.path // "")"' "$ARGO_METADATA_FILE")
-
-    for i in "${!selected_indices[@]}"; do
-        local idx="${selected_indices[$i]}"
-        local tag="${tags[$idx]}"
-        local name="${names[$idx]}"
-        local port="${ports[$idx]}"
-        local proto_full="${protocols[$idx]}"
-        local type="${types[$idx]}"
-        local token="${tokens[$idx]}"
-        local uuid="${uuids[$idx]}"
-        local password="${passwords[$idx]}"
-        local ws_path="${paths[$idx]}"
-        
-        # 提取 protocol 简写用于 _start_argo_tunnel (vless/trojan)
-        local proto_short="vless"
-        [[ "$proto_full" == "trojan-ws" ]] && proto_short="trojan"
-
-        _info "正在重启: $name (端口: $port)..."
-        
-        # 停止
-        _stop_argo_tunnel "$port"
-        sleep 1
-        
-        # 启动
-        local new_domain=""
-        if [ "$type" == "fixed" ]; then
-            if _start_argo_tunnel "$port" "$proto_short-ws" "$token"; then
-                 new_domain=$(jq -r --arg tag "$tag" '.[$tag].domain // empty' "$ARGO_METADATA_FILE")
-            else
-                 _error "固定隧道重启失败: $name"
-            fi
-        else
-            new_domain=$(_start_argo_tunnel "$port" "$proto_short-ws")
-            if [ -n "$new_domain" ]; then
-                 _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].domain = $domain' \
-                     --arg tag "$tag" --arg domain "$new_domain"
-                 _success "更新临时域名: $new_domain"
-                 
-                 # [同步链接] 临时域名变动，立即重新持久化链接
-                 if [[ "$proto_full" == "vless-ws" ]]; then
-                     _show_node_link "vless-ws" "$name" "$new_domain" "443" "$tag" "$uuid" "$ws_path" >/dev/null
-                 else
-                     _show_node_link "trojan-ws" "$name" "$new_domain" "443" "$tag" "$password" "$ws_path" >/dev/null
-                 fi
-            else
-                 _error "临时隧道重启失败: $name"
-            fi
-        fi
-    done
-    _success "操作完成。"
-}
-
 # --- Argo 守护进程逻辑 ---
 
-_argo_keepalive() {
+_argo_keepalive_locked() {
     # keepalive 使用受保护运行目录中的 flock，避免可预测 /tmp 锁和并发重启。
     _prepare_argo_runtime_dir || return 1
     command -v flock >/dev/null 2>&1 || { _error "缺少 flock，Argo 守护任务已拒绝无锁运行。"; return 1; }
@@ -2733,12 +2251,7 @@ _argo_keepalive() {
                           --arg tag "$tag" --arg domain "$new_domain"
                       logger "sing-box-watchdog: Temp tunnel $tag restarted with new domain: $new_domain"
                       
-                      # [同步链接] 临时域名变动，静默更新持久化链接
-                      if [[ "$protocol" == "vless-ws" ]]; then
-                          _show_node_link "vless-ws" "$name" "$new_domain" "443" "$tag" "$uuid" "$path" >/dev/null
-                      else
-                          _show_node_link "trojan-ws" "$name" "$new_domain" "443" "$tag" "$password" "$path" >/dev/null
-                      fi
+                      _with_state_lock _argo_refresh_artifacts "$tag" || logger "sing-box-watchdog: Failed to refresh $tag"
                  else
                       logger "sing-box-watchdog: Failed to restart temp tunnel $tag."
                  fi
@@ -2835,78 +2348,6 @@ _disable_argo_watchdog() {
     fi
 }
 
-_uninstall_argo() {
-    _warning "！！！警告！！！"
-    _warning "本操作将删除所有 Argo 隧道节点和 cloudflared 程序。"
-    echo ""
-    echo "即将删除的内容："
-    echo -e "  ${RED}-${NC} cloudflared 程序: ${CLOUDFLARED_BIN}"
-    echo -e "  ${RED}-${NC} 所有 Argo 日志文件和元数据文件"
-    
-    if [ -f "$ARGO_METADATA_FILE" ]; then
-        local argo_count=$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null || echo "0")
-        echo -e "  ${RED}-${NC} Argo 节点数量: ${argo_count} 个"
-    fi
-    
-    echo ""
-    read -p "$(echo -e ${YELLOW}"确定要卸载 Argo 服务吗? (y/N): "${NC})" confirm
-    
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        _info "卸载已取消。"
-        return
-    fi
-    
-    _info "正在卸载 Argo 服务..."
-    
-    # 1. 停止所有隧道进程
-    _stop_all_argo_tunnels
-    
-    # 2. 删除 sing-box 中的 Argo inbound 配置
-    if [ -f "$ARGO_METADATA_FILE" ]; then
-        # 先保存键数组；不要依赖空白拆词，也不要把键直接拼进 jq 程序。
-        local tags=()
-        mapfile -t tags < <(jq -r 'keys[]' "$ARGO_METADATA_FILE" 2>/dev/null)
-        local tag node_name
-        for tag in "${tags[@]}"; do
-             if [ -n "$tag" ]; then
-                _info "正在删除 Argo 隧道: $tag ..."
-                node_name=$(jq -r --arg tag "$tag" '.[$tag].name // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
-                _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" 2>/dev/null
-                _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag"
-                
-                if [ -n "$node_name" ] && [ "$node_name" != "null" ]; then
-                    _remove_node_from_yaml "$node_name"
-                fi
-             fi
-        done
-    fi
-    
-    # 3. 移除守护进程
-    _disable_argo_watchdog
-
-    # 4. 删除 cloudflared 和相关文件及服务
-    _info "正在清理 cloudflared 文件及服务..."
-    
-    if command -v systemctl &>/dev/null; then
-        systemctl stop cloudflared >/dev/null 2>&1
-        systemctl disable cloudflared >/dev/null 2>&1
-    fi
-    
-    _stop_all_argo_tunnels 2>/dev/null
-    
-    # 删除所有 PID/LOG 文件；旧 /tmp PID 已由 _stop_all_argo_tunnels 校验后处理。
-    rm -f "$RUNTIME_DIR"/argo-*.pid /var/log/singbox_argo_*.log
-    rm -f /tmp/singbox_argo_*.pid /tmp/singbox_argo_*.log
-    rm -f "${CLOUDFLARED_BIN}" "${ARGO_METADATA_FILE}"
-    rm -rf "/etc/cloudflared"
-    
-    # 4. 重启 sing-box
-    _manage_service "restart"
-    
-    _success "Argo 服务已完全卸载！"
-    _success "已释放 cloudflared 占用的空间。"
-}
-
 _view_argo_logs() {
     if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
         _warning "当前没有任何 Argo 隧道节点。"
@@ -2946,56 +2387,6 @@ _view_argo_logs() {
     fi
 }
 
-_sync_argo_early_data() {
-    local config_updated=false
-    local links_updated=false
-    local yaml_updated=false
-
-    export WS_ED="$WS_EARLY_DATA_SIZE"
-    export WS_EDH="$WS_EARLY_DATA_HEADER"
-
-    if [ -s "$CONFIG_FILE" ] && jq -e 'any(.inbounds[]?; ((.tag // "" | startswith("argo-")) and ((.transport.type // "") == "ws") and (((.transport.max_early_data // 0) != (env.WS_ED | tonumber)) or ((.transport.early_data_header_name // "") != env.WS_EDH))))' "$CONFIG_FILE" >/dev/null 2>&1; then
-        _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select((.tag // "" | startswith("argo-")) and ((.transport.type // "") == "ws")) | .transport.max_early_data) = (env.WS_ED | tonumber) | (.inbounds[] | select((.tag // "" | startswith("argo-")) and ((.transport.type // "") == "ws")) | .transport.early_data_header_name) = env.WS_EDH' || return 1
-        config_updated=true
-    fi
-
-    if [ -s "$ARGO_METADATA_FILE" ]; then
-        while IFS=$'\t' read -r tag protocol name domain uuid password path share_link; do
-            [ -z "$tag" ] && continue
-            [[ "$protocol" != "vless-ws" && "$protocol" != "trojan-ws" ]] && continue
-            [[ -z "$domain" || "$domain" == "null" ]] && continue
-
-            if [ -s "$CLASH_YAML_FILE" ] && [ -x "$YQ_BINARY" ] && [ -n "$name" ] && [ "$name" != "null" ]; then
-                export PROXY_NAME="$name"
-                local yaml_needs_update
-                yaml_needs_update=$(${YQ_BINARY} eval '.proxies[] | select(.name == env(PROXY_NAME) and .network == "ws" and (((.["ws-opts"]["max-early-data"] // "") | tostring) != strenv(WS_ED) or (.["ws-opts"]["early-data-header-name"] // "") != env(WS_EDH))) | .name' "$CLASH_YAML_FILE" 2>/dev/null | head -n 1)
-                if [ -n "$yaml_needs_update" ] && [ "$yaml_needs_update" != "null" ]; then
-                    _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(PROXY_NAME) and .network == "ws") | .["ws-opts"]["max-early-data"]) = (env(WS_ED) | tonumber) | (.proxies[] | select(.name == env(PROXY_NAME) and .network == "ws") | .["ws-opts"]["early-data-header-name"]) = env(WS_EDH)' >/dev/null 2>&1 && yaml_updated=true
-                fi
-            fi
-
-            if [[ "$share_link" == *"ed%3D${WS_EARLY_DATA_SIZE}"* || "$share_link" == *"ed=${WS_EARLY_DATA_SIZE}"* ]]; then
-                continue
-            fi
-
-            if [[ "$protocol" == "vless-ws" && -n "$uuid" && "$uuid" != "null" ]]; then
-                _show_node_link "vless-ws" "$name" "$domain" "443" "$tag" "$uuid" "$path" >/dev/null
-                links_updated=true
-            elif [[ "$protocol" == "trojan-ws" && -n "$password" && "$password" != "null" ]]; then
-                _show_node_link "trojan-ws" "$name" "$domain" "443" "$tag" "$password" "$path" >/dev/null
-                links_updated=true
-            fi
-        done < <(jq -r 'to_entries[] | [.key, (.value.protocol // "vless-ws"), (.value.name // ""), (.value.domain // ""), (.value.uuid // ""), (.value.password // ""), (.value.path // "/"), (.value.share_link // "")] | @tsv' "$ARGO_METADATA_FILE" 2>/dev/null)
-    fi
-
-    if [ "$config_updated" = true ]; then
-        _info "已为既有 Argo WS 节点补齐 Early Data 配置，正在重启 sing-box..."
-        _manage_service restart
-    elif [ "$links_updated" = true ] || [ "$yaml_updated" = true ]; then
-        _info "已同步既有 Argo WS 节点的 Early Data 客户端配置。"
-    fi
-}
-
 _argo_menu() {
     _sync_argo_early_data
     while true; do
@@ -3009,6 +2400,8 @@ _argo_menu() {
         echo -e "  ${CYAN}【创建节点】${NC}"
         echo -e "    ${GREEN}[1]${NC} 创建 VLESS-WS + Argo 节点"
         echo -e "    ${GREEN}[2]${NC} 创建 Trojan-WS + Argo 节点"
+        echo "    [8] XHTTP + Argo (Xray)   [9] HTTPUpgrade + Argo"
+        echo "    [10] gRPC TLS (直连/CDN；公网 Tunnel 不支持)   [11] 绑定域名"
         echo ""
         
         echo -e "  ${CYAN}【节点管理】${NC}"
@@ -3026,7 +2419,7 @@ _argo_menu() {
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
         
-        read -p "  请输入选项 [0-7]: " choice
+        read -p "  请输入选项 [0-11]: " choice
 
         case $choice in
             1) _add_argo_vless_ws ;;
@@ -3036,6 +2429,15 @@ _argo_menu() {
             5) _delete_argo_node ;;
             6) _uninstall_argo ;;
             7) _restart_argo_tunnel_menu ;;
+            8|9)
+                local argo_protocol argo_transport
+                read -r -p "协议 [1 VLESS / 2 Trojan] (默认 1): " argo_protocol
+                case "${argo_protocol:-1}" in 1) argo_protocol=vless ;; 2) argo_protocol=trojan ;; *) continue ;; esac
+                [ "$choice" = 8 ] && argo_transport=xhttp || argo_transport=httpupgrade
+                _add_argo_node "$argo_protocol" "$argo_transport"
+                ;;
+            10) _run_main_create_transaction _add_vless_grpc_tls ;;
+            11) _binding_menu ;;
             0) break ;;
             *) _error "无效选项" ;;
         esac
@@ -3224,6 +2626,7 @@ _uninstall() {
 
     # 1. Argo 必须在删除元数据前停止，否则会失去受控 PID 到端口的映射，
     # 留下仍在运行的 cloudflared 进程。
+    _subscription_http_stop 2>/dev/null || true
     _disable_argo_watchdog 2>/dev/null || true
     _stop_all_argo_tunnels 2>/dev/null || true
 
@@ -7243,7 +6646,7 @@ _update_script_locked() {
     fi
 
     local cache_bust downloaded_version script_name script_path script_url stage backup i j
-    local names=("singbox.sh" "advanced_relay.sh" "parser.sh" "xray_manager.sh")
+    local names=("singbox.sh" "advanced_relay.sh" "parser.sh" "xray_manager.sh" "network_features.sh")
     local targets=("$SELF_SCRIPT_PATH")
     local urls=()
     local stages=() backups=() had_original=()
@@ -7722,7 +7125,7 @@ _advanced_features() {
         fi
         # 赋予权限并执行
         chmod 755 "$script_path"
-        bash "$script_path"
+        bash "$script_path" "$@"
     else
         _error "找不到进阶脚本文件: ${script_path}"
     fi
@@ -7761,7 +7164,7 @@ _xray_features() {
             return 1
         fi
         chmod 755 "$script_path"
-        bash "$script_path"
+        bash "$script_path" "$@"
     else
         _error "找不到 Xray 管理脚本: ${script_path}"
     fi
@@ -7928,13 +7331,14 @@ _main_menu() {
         echo -e "  ${CYAN}【进阶功能】${NC}"
         echo -e "    ${GREEN}[18]${NC} 落地/中转/第三方节点导入"
         echo -e "    ${GREEN}[19]${NC} Xray 节点管理"
+        echo "    [20] 绑定域名   [21] 统一 SOCKS5 出口   [22] 订阅管理"
         echo ""
         
         echo -e "  ─────────────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-19]: " choice
+        read -p "  请输入选项 [0-22]: " choice
  
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
@@ -7956,6 +7360,9 @@ _main_menu() {
             17) _uninstall ;; 
             18) _require_singbox && _advanced_features ;;
             19) _xray_features ;;
+            20) _binding_menu ;;
+            21) _egress_menu ;;
+            22) _require_singbox && _subscription_menu ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
@@ -8683,10 +8090,16 @@ main() {
 
         # 3.1 初始化中转配置 (配置隔离)
         _init_relay_config
+        local egress_before config_updated=false
+        egress_before=$(jq -cS . "$CONFIG_FILE")
+        if [ -f "${SINGBOX_DIR}/egress.json" ]; then
+            _with_state_lock _apply_socks_egress "$(jq -c .outbound "${SINGBOX_DIR}/egress.json")" || return 1
+        fi
         _ensure_relay_config || { _error "无法初始化 relay.json。"; return 1; }
         
+        [ "$egress_before" = "$(jq -cS . "$CONFIG_FILE")" ] || config_updated=true
+
         # 3.2 [关键修复] 清理主配置文件中的旧版残留
-        local config_updated=false
         if _cleanup_legacy_config; then
             config_updated=true
         fi
@@ -8753,12 +8166,31 @@ main() {
         _warn "sing-box 核心未安装。请通过主菜单【核心管理】进行安装。"
     fi
     
+    server_ip=$(_get_client_address)
     _main_menu
 }
+
+_load_network_features() {
+    local feature_path="${SCRIPT_DIR}/network_features.sh"
+    [ -f "$feature_path" ] || feature_path="${SINGBOX_DIR}/network_features.sh"
+    if [ ! -f "$feature_path" ]; then
+        _download_bash_script_atomic "${GITHUB_RAW_BASE}/network_features.sh" "$feature_path" network_features.sh || return 1
+    fi
+    bash -n "$feature_path" || return 1
+    source "$feature_path"
+}
+_load_network_features || { _error "网络功能模块加载失败。请将 network_features.sh 与主脚本一同部署。"; exit 1; }
+
+# 测试可仅加载函数，不安装依赖、启动服务或修改系统。
+if [[ "${SINGBOXLITE_LIBRARY_ONLY:-0}" = 1 ]]; then return 0 2>/dev/null || exit 0; fi
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        subscription-keepalive)
+            _with_state_lock _subscription_http_start
+            exit $?
+            ;;
         keepalive)
             _argo_keepalive
             exit 0

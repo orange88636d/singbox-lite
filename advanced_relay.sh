@@ -11,7 +11,7 @@ umask 077
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/orange88636d/singbox-lite/main"
 
 # [整合方案] 检测父进程导出的工具函数
 # 如果独立运行且函数缺失，可在此定义最简兜底逻辑 (可选)
@@ -3824,6 +3824,21 @@ _menu() {
 }
 # 命令行参数解析：支持 cron 定时任务直接调用刷新函数
 case "${1:-}" in
+    subscription-node)
+        _check_root || exit 1
+        _check_deps || exit 1
+        _install_yq || exit 1
+        _init_relay_dirs || exit 1
+        # 节点数据走独立 FD，标准输入留给中转入口的交互提示。
+        subscription_outbound=$(cat <&3) || exit 1
+        if ! jq -e 'type == "object" and (.type as $t | ["socks","http","shadowsocks","vless","trojan","hysteria2","anytls"] | index($t))
+            and (has("detour") | not) and (has("bind_interface") | not)' <<< "$subscription_outbound" >/dev/null; then
+            _error "订阅节点不符合允许的 outbound schema。"; exit 1
+        fi
+        _finalize_relay_setup "$(jq -r .type <<< "$subscription_outbound")" \
+            "$(jq -r .server <<< "$subscription_outbound")" "$(jq -r .server_port <<< "$subscription_outbound")" "$subscription_outbound"
+        exit $?
+        ;;
     pf-dns-refresh)
         _check_root || exit 1
         _check_deps || exit 1

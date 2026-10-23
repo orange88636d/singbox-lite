@@ -127,7 +127,7 @@ _validate_ss2022_password() {
     local password="$1" method="$2" expected_bytes server_key user_key
     case "$method" in
         2022-blake3-aes-128-gcm) expected_bytes=16 ;;
-        2022-blake3-aes-256-gcm) expected_bytes=32 ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) expected_bytes=32 ;;
         *) return 1 ;;
     esac
     server_key="$password"
@@ -645,6 +645,92 @@ _parse_http_uri() {
     printf '%s\n' "$output"
 }
 
+_parse_subscription_uri() {
+    local link="$1" body authority user endpoint query="" protocol out network security sni path host service
+    local username="" password="" key flow
+    protocol="${link%%://*}"
+    case "$protocol" in
+        ss)
+            # 各算法仍走原严格解析路径，禁止插件及无效 SS2022 密钥。
+            local method result
+            for method in aes-128-gcm aes-256-gcm chacha20-ietf-poly1305 xchacha20-ietf-poly1305 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305; do
+                result=$(_parse_ss_uri "$link" "$method" 2>/dev/null) && { printf '%s\n' "$result"; return; }
+            done
+            _fatal "订阅 Shadowsocks 节点格式、算法或密钥不受支持"
+            ;;
+        http|https) _parse_http_uri "$link"; return ;;
+        vless) _parse_vless_uri "$link"; username="$VLESS_UUID" ;;
+        trojan|socks|socks5|anytls|hysteria2|hy2)
+            body="${link#*://}"; body="${body%%#*}"
+            if [[ "$body" == *\?* ]]; then query="${body#*\?}"; body="${body%%\?*}"; fi
+            if [[ "$body" == *@* ]]; then user="${body%@*}"; endpoint="${body##*@}"; else user=""; endpoint="$body"; fi
+            _split_host_port "${endpoint%/}" || _fatal "订阅节点地址或端口无效"
+            _parse_query "$query" || _fatal "订阅查询参数无效"
+            if [[ "$protocol" == socks* ]]; then
+                if [[ -n "$user" ]]; then
+                    [[ "$user" == *:* ]] || _fatal "SOCKS 凭据须为 URL 编码的 username:password"
+                    _url_decode "${user%%:*}" || _fatal "SOCKS 用户名编码无效"; username="$DECODED_VALUE"
+                    _url_decode "${user#*:}" || _fatal "SOCKS 密码编码无效"; password="$DECODED_VALUE"
+                    [[ -n "$username" ]] || _fatal "SOCKS 用户名不能为空"
+                fi
+                _require_query_keys
+                jq -n --arg s "$PARSED_SERVER" --argjson p "$PARSED_PORT" --arg u "$username" --arg pw "$password" \
+                    '{type:"socks",tag:"proxy",server:$s,server_port:$p,version:"5"} + if $u != "" then {username:$u,password:$pw} else {} end'
+                return
+            fi
+            _url_decode "$user" || _fatal "密码编码无效"; password="$DECODED_VALUE"
+            [[ -n "$password" ]] || _fatal "订阅节点密码不能为空"
+            [[ "$protocol" != hy2 ]] || protocol=hysteria2
+            ;;
+        *) _fatal "不支持的订阅节点协议" ;;
+    esac
+    _require_query_keys encryption flow security type sni servername peer host path serviceName mode fp pbk sid insecure allowInsecure alpn obfs obfs-password
+    if [[ "$protocol" == vless ]]; then PARSED_SERVER="$VLESS_SERVER"; PARSED_PORT="$VLESS_PORT"; fi
+    [[ -z "${QUERY_PARAMS[encryption]-}" || "${QUERY_PARAMS[encryption]}" == none ]] || _fatal "不支持的 VLESS encryption"
+    network="${QUERY_PARAMS[type]-tcp}"; security="${QUERY_PARAMS[security]-}"
+    if [[ -z "$security" ]]; then [[ "$protocol" == vless ]] && security=none || security=tls; fi
+    case "$security" in none|tls|reality) ;; *) _fatal "不支持的 security" ;; esac
+    case "$network" in tcp|ws|grpc|httpupgrade) ;; *) _fatal "订阅传输不受 sing-box 支持（XHTTP 需要 Xray 客户端）" ;; esac
+    [[ "$protocol" == vless || "$security" == tls ]] || _fatal "该协议仅接受 TLS 节点"
+    flow="${QUERY_PARAMS[flow]-}"
+    [[ -z "$flow" || ( "$protocol" == vless && "$network" == tcp && "$security" == reality && "$flow" == xtls-rprx-vision ) ]] || _fatal "flow 与传输不兼容"
+    sni="${QUERY_PARAMS[sni]-${QUERY_PARAMS[servername]-${QUERY_PARAMS[peer]-$PARSED_SERVER}}}"
+    _validate_server "$sni" || _fatal "SNI 格式无效"
+    out=$(jq -n --arg t "$protocol" --arg s "$PARSED_SERVER" --argjson p "$PARSED_PORT" --arg u "$username" --arg pw "$password" --arg flow "$flow" \
+        '{type:$t,tag:"proxy",server:$s,server_port:$p} + if $t == "vless" then {uuid:$u,flow:$flow} else {password:$pw} end') || _fatal "生成节点失败"
+    if [[ "$security" != none ]]; then
+        local insecure="${QUERY_PARAMS[insecure]-${QUERY_PARAMS[allowInsecure]-0}}"
+        case "$insecure" in 0|false) insecure=false ;; 1|true) insecure=true ;; *) _fatal "insecure 参数无效" ;; esac
+        out=$(jq --arg s "$sni" --argjson i "$insecure" '.tls={enabled:true,server_name:$s,insecure:$i}' <<< "$out")
+        if [[ -n "${QUERY_PARAMS[alpn]-}" ]]; then out=$(jq --arg a "${QUERY_PARAMS[alpn]}" '.tls.alpn=($a|split(","))' <<< "$out"); fi
+        if [[ -n "${QUERY_PARAMS[fp]-}" || "$security" == reality ]]; then
+            local fp="${QUERY_PARAMS[fp]-chrome}"
+            case "$fp" in chrome|firefox|edge|safari|360|qq|ios|android|random|randomized) ;; *) _fatal "uTLS 指纹无效" ;; esac
+            out=$(jq --arg fp "$fp" '.tls.utls={enabled:true,fingerprint:$fp}' <<< "$out")
+        fi
+        if [[ "$security" == reality ]]; then
+            local pk="${QUERY_PARAMS[pbk]-}" sid="${QUERY_PARAMS[sid]-}"
+            [[ "$pk" =~ ^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$ && "$sid" =~ ^[0-9a-fA-F]{0,16}$ && $(( ${#sid} % 2 )) == 0 ]] || _fatal "Reality 公钥或 short id 无效"
+            out=$(jq --arg pk "$pk" --arg sid "$sid" '.tls.reality={enabled:true,public_key:$pk,short_id:$sid}' <<< "$out")
+        fi
+    fi
+    path="${QUERY_PARAMS[path]-/}"; host="${QUERY_PARAMS[host]-$sni}"
+    case "$network" in
+        ws|httpupgrade)
+            [[ "$path" == /* ]] || path="/$path"
+            out=$(jq --arg t "$network" --arg path "$path" --arg host "$host" '.transport={type:$t,path:$path} + if $t == "ws" then {headers:{Host:$host}} else {host:$host} end' <<< "$out") ;;
+        grpc)
+            service="${QUERY_PARAMS[serviceName]-}"
+            [[ "${QUERY_PARAMS[mode]-gun}" == gun ]] || _fatal "仅支持 gRPC gun 模式"
+            out=$(jq --arg s "$service" '.transport={type:"grpc",service_name:$s}' <<< "$out") ;;
+    esac
+    if [[ "$protocol" == hysteria2 && -n "${QUERY_PARAMS[obfs]-}" ]]; then
+        [[ "${QUERY_PARAMS[obfs]}" == salamander && -n "${QUERY_PARAMS[obfs-password]-}" ]] || _fatal "Hysteria2 obfs 无效"
+        out=$(jq --arg pw "${QUERY_PARAMS[obfs-password]}" '.obfs={type:"salamander",password:$pw}' <<< "$out")
+    fi
+    printf '%s\n' "$out"
+}
+
 _read_link() {
     local argument_count extra read_status
     argument_count="$1"
@@ -675,7 +761,7 @@ _read_link() {
 
 MODE="$1"
 case "$MODE" in
-    vless-reality-vision|vless-tcp|vless-ws-tls|ss-aes-128-gcm|ss-aes-256-gcm|ss-2022-aes-128-gcm|ss-2022-aes-256-gcm|https-proxy) ;;
+    subscription|vless-reality-vision|vless-tcp|vless-ws-tls|ss-aes-128-gcm|ss-aes-256-gcm|ss-2022-aes-128-gcm|ss-2022-aes-256-gcm|https-proxy) ;;
     *) _fatal "不支持的解析模式" ;;
 esac
 
@@ -689,6 +775,7 @@ esac
 _read_link "$#" "${2-}"
 
 case "$MODE" in
+    subscription) _parse_subscription_uri "$LINK_INPUT" ;;
     vless-reality-vision) _parse_vless_reality_vision "$LINK_INPUT" ;;
     vless-tcp) _parse_vless_tcp "$LINK_INPUT" ;;
     vless-ws-tls) _parse_vless_ws_tls "$LINK_INPUT" ;;
