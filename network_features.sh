@@ -152,6 +152,13 @@ _binding_menu() {
 }
 
 _bind_argo_domain() {
+    local meta
+    meta=$(jq -c --arg t "$1" '.[$t]' "$ARGO_METADATA_FILE") || return 1
+    if [[ "$(jq -r .protocol <<< "$meta")" == *-xhttp ]]; then
+        _argo_xhttp_supported "$(jq -r .type <<< "$meta")" "$2" || {
+            _error "XHTTP 需要 Token 固定隧道和自有域名；仅修改临时隧道的域名不能修复。"; return 1;
+        }
+    fi
     _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].domain = $domain' --arg tag "$1" --arg domain "$2" || return 1
     _argo_refresh_artifacts "$1"
 }
@@ -264,11 +271,27 @@ _build_argo_xray_inbound() {
              else {xhttpSettings:{path:$path,mode:"packet-up"}} end))}'
 }
 
+_argo_xhttp_supported() {
+    local mode="$1" domain="${2,,}"
+    domain="${domain%.}"
+    [ "$mode" = fixed ] && _valid_domain "$domain" &&
+        [[ "$domain" != trycloudflare.com && "$domain" != *.trycloudflare.com ]]
+}
+
+_warn_argo_xhttp_tunnels() {
+    [ -s "$ARGO_METADATA_FILE" ] || return 0
+    local entry
+    while IFS= read -r entry; do
+        _argo_xhttp_supported "$(jq -r '.type // "temp"' <<< "$entry")" "$(jq -r '.domain // ""' <<< "$entry")" && continue
+        _warn "XHTTP 节点 [$(jq -r .name <<< "$entry")] 使用不支持的临时隧道；请用 Token 和自有域名创建固定 XHTTP 节点。"
+    done < <(jq -c '.[] | select(.protocol == "vless-xhttp" or .protocol == "trojan-xhttp")' "$ARGO_METADATA_FILE")
+    return 0
+}
+
 _create_argo_node() {
     local protocol="$1" transport="${2:-ws}" core=singbox port path credential custom_password mode token="" domain="" name tag inbound meta
     case "$protocol:$transport" in vless:ws|trojan:ws) ;; vless:xhttp|trojan:xhttp|vless:httpupgrade|trojan:httpupgrade) core=xray ;; *) return 1 ;; esac
     [ "$core" != xray ] || [ -x "$FEATURE_XRAY_BIN" ] || { _error "${transport} 需要先通过主菜单 [16] 安装 Xray 核心。"; return 1; }
-    _install_cloudflared || return 1
     read -r -p "Argo 本地端口 (回车随机): " port
     [ -n "$port" ] || port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 40000 + 20000 ))
     [[ "$port" =~ ^[1-9][0-9]{3,4}$ ]] && [ "$port" -le 65535 ] || { _error "端口应在 1024-65535 之间。"; return 1; }
@@ -283,7 +306,14 @@ _create_argo_node() {
         credential=${custom_password:-$credential}
     fi
     [ -n "$credential" ] || return 1
-    read -r -p "隧道模式 [1 临时 / 2 固定] (默认 1): " mode; mode=${mode:-1}
+    if [ "$transport" = xhttp ]; then
+        _info "XHTTP 仅支持 Token 固定隧道和自有域名；trycloudflare.com 临时隧道会缓冲下行，导致连接卡住。"
+        read -r -p "隧道模式 [2 固定 / 0 返回] (默认 2): " mode; mode=${mode:-2}
+        [ "$mode" != 0 ] || return 1
+        [ "$mode" = 2 ] || { _error "XHTTP 不支持临时隧道，请选择固定隧道。"; return 1; }
+    else
+        read -r -p "隧道模式 [1 临时 / 2 固定] (默认 1): " mode; mode=${mode:-1}
+    fi
     case "$mode" in
         1) mode=temp ;;
         2)
@@ -297,6 +327,10 @@ _create_argo_node() {
             ;;
         *) return 1 ;;
     esac
+    if [ "$transport" = xhttp ]; then
+        _argo_xhttp_supported "$mode" "$domain" || { _error "XHTTP 固定隧道必须使用自有域名，不能使用 trycloudflare.com。"; return 1; }
+    fi
+    _install_cloudflared || return 1
     read -r -p "节点名称 (回车默认): " name
     name=${name:-Argo-${protocol}-${transport}-${port}}
     export PROXY_NAME="$name"

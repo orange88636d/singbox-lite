@@ -106,8 +106,27 @@ jq -e '.inbounds[0].streamSettings.network == "httpupgrade" and .inbounds[0].lis
 jq -e '.[] | .core == "xray" and (.share_link|contains("type=httpupgrade") and contains("alpn=http%2F1.1"))' "$ARGO_METADATA_FILE" >/dev/null
 _feature_transaction _create_argo_node trojan httpupgrade <<< $'18004\n/trojan\ntest-password\n1\nTest-trojan-upgrade'
 _feature_transaction _create_argo_node trojan ws <<< $'18002\n/ws\n\n1\nTest-ws'
-_feature_transaction _create_argo_node vless xhttp <<< $'18003\n/xhttp\n1\nTest-xhttp'
+cp "$FEATURE_XRAY_CONFIG" "$SINGBOX_DIR/pre-xhttp-xray"
+cp "$ARGO_METADATA_FILE" "$SINGBOX_DIR/pre-xhttp-meta"
+cp "$SINGBOX_DIR/restarts" "$SINGBOX_DIR/pre-xhttp-restarts"
+_install_cloudflared() { touch "$SINGBOX_DIR/cloudflared-installed"; }
+if _feature_transaction _create_argo_node vless xhttp <<< $'18003\n/xhttp\n1'; then echo 'temporary XHTTP accepted'; exit 1; fi
+if _feature_transaction _create_argo_node vless xhttp <<< $'18003\n/xhttp\n2\neyTESTTOKEN12345678901234567890\nwrong.trycloudflare.com'; then echo 'temporary XHTTP domain accepted'; exit 1; fi
+cmp "$FEATURE_XRAY_CONFIG" "$SINGBOX_DIR/pre-xhttp-xray"
+cmp "$ARGO_METADATA_FILE" "$SINGBOX_DIR/pre-xhttp-meta"
+cmp "$SINGBOX_DIR/restarts" "$SINGBOX_DIR/pre-xhttp-restarts"
+[ ! -f "$SINGBOX_DIR/cloudflared-installed" ]
+_feature_transaction _create_argo_node vless xhttp <<< $'18003\n/xhttp\n\neyTESTTOKEN12345678901234567890\nxhttp.example.com\nTest-xhttp'
 jq -e 'any(.inbounds[]; .streamSettings.xhttpSettings.mode == "packet-up" and .listen == "127.0.0.1")' "$FEATURE_XRAY_CONFIG" >/dev/null
+jq -e '.["argo-vless-xhttp-18003"] | .type == "fixed" and .domain == "xhttp.example.com" and (.share_link|contains("mode=packet-up"))' "$ARGO_METADATA_FILE" >/dev/null
+if _feature_transaction _bind_argo_domain argo-vless-xhttp-18003 wrong.TRYCLOUDFLARE.com.; then echo 'temporary XHTTP rebind accepted'; exit 1; fi
+jq -e '.["argo-vless-xhttp-18003"].domain == "xhttp.example.com"' "$ARGO_METADATA_FILE" >/dev/null
+_atomic_modify_json "$ARGO_METADATA_FILE" '.old_xhttp={name:"Old XHTTP",protocol:"vless-xhttp",type:"temp",domain:"old.trycloudflare.com"}'
+_warn_argo_xhttp_tunnels > "$SINGBOX_DIR/xhttp-warning" 2>&1
+grep -q 'Old XHTTP' "$SINGBOX_DIR/xhttp-warning"
+_atomic_modify_json "$ARGO_METADATA_FILE" 'del(.old_xhttp)'
+_feature_transaction _create_argo_node trojan xhttp <<< $'18006\n/trojan-xhttp\ntest-xhttp-password\n2\neyTESTTOKEN12345678901234567890\ntrojan-xhttp.example.com\nTest-trojan-xhttp'
+"$test_python" "$repo/tests/xhttp_smoke.py" "$test_xray" "$FEATURE_XRAY_CONFIG"
 tag=argo-trojan-ws-18002
 _feature_transaction _bind_argo_domain "$tag" fixed.example.com
 "$YQ_BINARY" eval -o=json '.proxies[0]' "$CLASH_YAML_FILE" | jq -e '.server == "fixed.example.com" and .sni == "fixed.example.com" and .["ws-opts"].headers.Host == "fixed.example.com"' >/dev/null

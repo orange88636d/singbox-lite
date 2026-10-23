@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v30`、`advanced_relay.sh v19`、`xray_manager.sh v3.2.0`。
+当前文档按以下脚本版本整理：`singbox.sh v31`、`advanced_relay.sh v19`、`xray_manager.sh v3.2.0`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -124,9 +124,11 @@ UDP 需要 SOCKS5 上游支持 UDP ASSOCIATE。此功能不接管操作系统自
 
 ## Argo 传输选项
 
-主菜单 `[2]` 中：`[1]/[2]` 为 VLESS/Trojan WebSocket，`[8]` 为 XHTTP，`[9]` 为 HTTPUpgrade，后两项均可选 VLESS 或 Trojan。内部监听仅绑定 `127.0.0.1`；WS 使用 sing-box，HTTPUpgrade 与 XHTTP 使用 Xray，需先安装对应核心。临时/固定隧道、重启、自动守护、删除和域名同步均使用同一份 Argo 元数据。
+主菜单 `[2]` 中：`[1]/[2]` 为 VLESS/Trojan WebSocket，`[8]` 为 XHTTP，`[9]` 为 HTTPUpgrade，后两项均可选 VLESS 或 Trojan。内部监听仅绑定 `127.0.0.1`；WS 使用 sing-box，HTTPUpgrade 与 XHTTP 使用 Xray，需先安装对应核心。WS、HTTPUpgrade 可选临时/固定隧道；XHTTP 只允许 Token 固定隧道和自有域名。重启、自动守护、删除和域名同步均使用同一份 Argo 元数据。
 
 XHTTP 默认使用 `packet-up`，服务端与分享链接保持一致。XHTTP、HTTPUpgrade 输出 URI，建议使用支持该传输的 Xray 客户端；它们不会混入共享 Mihomo YAML。WebSocket 继续输出 Mihomo 配置并支持 Early Data。
+
+XHTTP 不支持 `trycloudflare.com` 临时隧道：其响应缓冲会阻塞 XHTTP 下行，节点能导入但无法正常转发。创建前需要在 Cloudflare 配置固定 Tunnel、Token，以及自有域名的 Public Hostname，Service 指向提示的 `http://localhost:端口`。旧临时 XHTTP 节点会在菜单提示，需重新创建固定节点；只修改分享链接域名或更换客户端内核不能解决。参见 [Xray 上游的排查记录](https://github.com/XTLS/Xray-core/pull/6835)。
 
 HTTPUpgrade 分享链接固定 `alpn=http/1.1`。当前 Xray 客户端发送 `Sec-WebSocket-Key`，而 sing-box HTTPUpgrade 服务端会将其判为真实 WebSocket 请求并返回 404，详见 [sing-box 服务端实现](https://github.com/SagerNet/sing-box/blob/v1.14.3/transport/v2rayhttpupgrade/server.go)。此行为没有 JSON 配置开关，因此由 Xray 服务端兼容两种客户端握手。旧版脚本创建的 sing-box HTTPUpgrade 节点会在运行 `sb` 或进入 Argo 菜单时迁移到 Xray，保留端口、认证、路径、域名和 Tunnel Token；迁移失败会恢复配置。未安装 Xray 时保留原配置并提示先用 `[16]` 安装。修复后请重新导入链接或刷新订阅。
 
@@ -350,6 +352,7 @@ python3 tests/jq_compat.py /path/to/jq-1.6 /path/to/jq
 
 ### 2026.10.24
 
+- 修复 XHTTP 默认允许临时隧道的问题：仅允许 Token 固定隧道加自有域名，在安装/写入核心配置前拒绝不支持的模式，并提示已有临时 XHTTP 节点。
 - 修复 HTTPUpgrade 节点能创建但当前 Xray 客户端连接返回 404：改用 Xray 承载并迁移旧 sing-box 入站，分享链接和订阅导入固定 HTTP/1.1 ALPN；增加真实双客户端转发及迁移回滚测试。
 - 修复 Argo 元数据对象的括号，兼容 jq 1.6；新增两种协议、三种传输和两种隧道模式的表达式回归测试。
 - 新增默认/已有节点域名绑定、Argo 固定域名切换和双核心统一 SOCKS5 出口。

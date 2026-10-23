@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="30"
+export SCRIPT_VERSION="31"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -2401,8 +2401,9 @@ _argo_menu() {
         echo -e "  ${CYAN}【创建节点】${NC}"
         echo -e "    ${GREEN}[1]${NC} 创建 VLESS-WS + Argo 节点"
         echo -e "    ${GREEN}[2]${NC} 创建 Trojan-WS + Argo 节点"
-        echo "    [8] XHTTP + Argo (Xray)   [9] HTTPUpgrade + Argo (Xray)"
+        echo "    [8] XHTTP + 固定 Argo (自有域名)   [9] HTTPUpgrade + Argo (Xray)"
         echo "    [10] gRPC TLS (直连/CDN；公网 Tunnel 不支持)   [11] 绑定域名"
+        _warn_argo_xhttp_tunnels
         echo ""
         
         echo -e "  ${CYAN}【节点管理】${NC}"
