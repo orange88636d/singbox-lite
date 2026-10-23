@@ -2,7 +2,7 @@
 
 一套面向 Linux 服务器的 sing-box + Xray 双核心管理脚本，提供节点创建、服务管理、落地/中转、第三方节点导入、端口转发、Argo 隧道和 Clash/Mihomo 配置输出。
 
-当前文档按以下脚本版本整理：`singbox.sh v29`、`advanced_relay.sh v19`、`xray_manager.sh v3.2.0`。
+当前文档按以下脚本版本整理：`singbox.sh v30`、`advanced_relay.sh v19`、`xray_manager.sh v3.2.0`。
 
 > 脚本需要 root 权限。请仅在拥有管理权或明确授权的服务器和网络中使用。
 
@@ -124,9 +124,11 @@ UDP 需要 SOCKS5 上游支持 UDP ASSOCIATE。此功能不接管操作系统自
 
 ## Argo 传输选项
 
-主菜单 `[2]` 中：`[1]/[2]` 为 VLESS/Trojan WebSocket，`[8]` 为 XHTTP，`[9]` 为 HTTPUpgrade，后两项均可选 VLESS 或 Trojan。内部监听仅绑定 `127.0.0.1`；WS 与 HTTPUpgrade 使用 sing-box，XHTTP 使用 Xray，需先安装对应核心。临时/固定隧道、重启、自动守护、删除和域名同步均使用同一份 Argo 元数据。
+主菜单 `[2]` 中：`[1]/[2]` 为 VLESS/Trojan WebSocket，`[8]` 为 XHTTP，`[9]` 为 HTTPUpgrade，后两项均可选 VLESS 或 Trojan。内部监听仅绑定 `127.0.0.1`；WS 使用 sing-box，HTTPUpgrade 与 XHTTP 使用 Xray，需先安装对应核心。临时/固定隧道、重启、自动守护、删除和域名同步均使用同一份 Argo 元数据。
 
 XHTTP 默认使用 `packet-up`，服务端与分享链接保持一致。XHTTP、HTTPUpgrade 输出 URI，建议使用支持该传输的 Xray 客户端；它们不会混入共享 Mihomo YAML。WebSocket 继续输出 Mihomo 配置并支持 Early Data。
+
+HTTPUpgrade 分享链接固定 `alpn=http/1.1`。当前 Xray 客户端发送 `Sec-WebSocket-Key`，而 sing-box HTTPUpgrade 服务端会将其判为真实 WebSocket 请求并返回 404，详见 [sing-box 服务端实现](https://github.com/SagerNet/sing-box/blob/v1.14.3/transport/v2rayhttpupgrade/server.go)。此行为没有 JSON 配置开关，因此由 Xray 服务端兼容两种客户端握手。旧版脚本创建的 sing-box HTTPUpgrade 节点会在运行 `sb` 或进入 Argo 菜单时迁移到 Xray，保留端口、认证、路径、域名和 Tunnel Token；迁移失败会恢复配置。未安装 Xray 时保留原配置并提示先用 `[16]` 安装。修复后请重新导入链接或刷新订阅。
 
 `httpupdate` 按 HTTPUpgrade 实现。gRPC TLS 保留在 Argo 菜单 `[10]` 作为直连/CDN 回源入口；[Cloudflare 官方说明](https://developers.cloudflare.com/cloudflare-one/faq/cloudflare-tunnels-faq/#does-cloudflare-tunnel-support-grpc)指出，公网 Tunnel hostname 不支持 gRPC，因此不会创建声称可用的公网 Argo gRPC 隧道。
 
@@ -339,6 +341,7 @@ Xray 与 sing-box 使用独立的服务和 JSON 配置，但共享 `/usr/local/e
 ```bash
 SB_TEST_BIN=/path/to/sing-box XRAY_TEST_BIN=/path/to/xray YQ_TEST_BIN=/path/to/yq bash tests/network_features.sh
 bash tests/http_config.sh
+python3 tests/jq_compat.py /path/to/jq-1.6 /path/to/jq
 ```
 
 可通过 `PYTHON_TEST_BIN` 指定 Python 可执行文件，默认 `python3`。测试数据写入临时目录，服务管理与 cloudflared 使用替身；配置检查使用真实核心，另通过回环 SOCKS 服务验证出口优先级及故障时不回退直连。订阅 HTTP 测试检查 Token、端点限制和实时刷新。在 Windows 上执行时，仅将 HTTP 测试中的 POSIX 文件锁替换为测试替身；Linux 服务启动、实际 UDP 转发和 Cloudflare 公网隧道仍需在目标环境验证。
@@ -347,6 +350,8 @@ bash tests/http_config.sh
 
 ### 2026.10.24
 
+- 修复 HTTPUpgrade 节点能创建但当前 Xray 客户端连接返回 404：改用 Xray 承载并迁移旧 sing-box 入站，分享链接和订阅导入固定 HTTP/1.1 ALPN；增加真实双客户端转发及迁移回滚测试。
+- 修复 Argo 元数据对象的括号，兼容 jq 1.6；新增两种协议、三种传输和两种隧道模式的表达式回归测试。
 - 新增默认/已有节点域名绑定、Argo 固定域名切换和双核心统一 SOCKS5 出口。
 - Argo 新增 XHTTP、HTTPUpgrade，可选 VLESS/Trojan；gRPC 保持直连/CDN 回源模式。
 - 新增订阅 URL 导入、更新、删除、节点池选择中转、SOCKS5 出口选择，以及聚合文件和带 Token 的实时 HTTP 订阅。

@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="29"
+export SCRIPT_VERSION="30"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -2388,6 +2388,7 @@ _view_argo_logs() {
 }
 
 _argo_menu() {
+    _repair_argo_httpupgrade || _warn "HTTPUpgrade 兼容修复未完成，请根据上方提示处理。"
     _sync_argo_early_data
     while true; do
         clear
@@ -2400,7 +2401,7 @@ _argo_menu() {
         echo -e "  ${CYAN}【创建节点】${NC}"
         echo -e "    ${GREEN}[1]${NC} 创建 VLESS-WS + Argo 节点"
         echo -e "    ${GREEN}[2]${NC} 创建 Trojan-WS + Argo 节点"
-        echo "    [8] XHTTP + Argo (Xray)   [9] HTTPUpgrade + Argo"
+        echo "    [8] XHTTP + Argo (Xray)   [9] HTTPUpgrade + Argo (Xray)"
         echo "    [10] gRPC TLS (直连/CDN；公网 Tunnel 不支持)   [11] 绑定域名"
         echo ""
         
@@ -8161,6 +8162,7 @@ main() {
         fi
         _setup_log_cleanup
         _secure_state_permissions
+        _repair_argo_httpupgrade || _warn "旧 HTTPUpgrade 节点暂未完成兼容修复；安装 Xray 后重新运行 sb。"
     else
         # --- sing-box 未安装：仅显示提示，不自动安装 ---
         _warn "sing-box 核心未安装。请通过主菜单【核心管理】进行安装。"

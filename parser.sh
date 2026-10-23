@@ -724,6 +724,10 @@ _parse_subscription_uri() {
             [[ "${QUERY_PARAMS[mode]-gun}" == gun ]] || _fatal "仅支持 gRPC gun 模式"
             out=$(jq --arg s "$service" '.transport={type:"grpc",service_name:$s}' <<< "$out") ;;
     esac
+    # HTTPUpgrade 使用 HTTP/1.1 的 101 握手，不能协商到 h2/h3。
+    if [[ "$network" == httpupgrade && "$security" != none ]]; then
+        out=$(jq '.tls.alpn=["http/1.1"]' <<< "$out") || _fatal "生成 HTTPUpgrade ALPN 失败"
+    fi
     if [[ "$protocol" == hysteria2 && -n "${QUERY_PARAMS[obfs]-}" ]]; then
         [[ "${QUERY_PARAMS[obfs]}" == salamander && -n "${QUERY_PARAMS[obfs-password]-}" ]] || _fatal "Hysteria2 obfs 无效"
         out=$(jq --arg pw "${QUERY_PARAMS[obfs-password]}" '.obfs={type:"salamander",password:$pw}' <<< "$out")

@@ -35,7 +35,7 @@ _feature_xray() (
 # 为跨核心改动建立独立事务；已有中转规则不被覆盖。失败或信号会恢复所有文件。
 _feature_transaction() { _with_state_lock _feature_transaction_locked "$@"; }
 _feature_transaction_locked() (
-    local tx committed=0 changed_sb=0 changed_xray=0 feature_new_argo_port=""
+    local tx committed=0 changed_sb=0 changed_xray=0 feature_new_argo_port="" feature_port_handoff=0
     local files=("$CONFIG_FILE" "$RELAY_CONFIG_FILE" "$METADATA_FILE" "$ARGO_METADATA_FILE" "$CLASH_YAML_FILE"
         "${SINGBOX_DIR}/domain.json" "${SINGBOX_DIR}/egress.json" "${SINGBOX_DIR}/subscriptions.json"
         "$FEATURE_XRAY_CONFIG" "$FEATURE_XRAY_METADATA")
@@ -48,6 +48,7 @@ _feature_transaction_locked() (
     trap 'rc=$?; trap - EXIT INT TERM; if [ "$committed" != 1 ]; then
         [ -z "$feature_new_argo_port" ] || _stop_argo_tunnel "$feature_new_argo_port"
         failed=0
+        if [ "$feature_port_handoff" = 1 ]; then _feature_xray _manage_xray_service stop >/dev/null 2>&1 || failed=1; fi
         cmp -s "$CONFIG_FILE" "$tx/0" || { [ ! -f "$CONFIG_FILE" ] && [ ! -f "$tx/0" ]; } || changed_sb=1
         cmp -s "$RELAY_CONFIG_FILE" "$tx/1" || { [ ! -f "$RELAY_CONFIG_FILE" ] && [ ! -f "$tx/1" ]; } || changed_sb=1
         cmp -s "$FEATURE_XRAY_CONFIG" "$tx/8" || { [ ! -f "$FEATURE_XRAY_CONFIG" ] && [ ! -f "$tx/8" ]; } || changed_xray=1
@@ -70,10 +71,10 @@ _feature_transaction_locked() (
     if [ -f "$CONFIG_FILE" ] && { [ ! -f "$tx/0" ] || ! cmp -s "$CONFIG_FILE" "$tx/0"; }; then changed_sb=1; fi
     if [ -f "$RELAY_CONFIG_FILE" ] && { [ ! -f "$tx/1" ] || ! cmp -s "$RELAY_CONFIG_FILE" "$tx/1"; }; then changed_sb=1; fi
     if [ -f "$FEATURE_XRAY_CONFIG" ] && { [ ! -f "$tx/8" ] || ! cmp -s "$FEATURE_XRAY_CONFIG" "$tx/8"; }; then changed_xray=1; fi
-    if [ "$changed_sb" = 1 ]; then _check_combined_config_files && _manage_service restart || return 1; fi
-    if [ "$changed_xray" = 1 ]; then
-        _feature_xray _validate_xray_config && _feature_xray _manage_xray_service restart || return 1
-    fi
+    if [ "$changed_sb" = 1 ]; then _check_combined_config_files || return 1; fi
+    if [ "$changed_xray" = 1 ]; then _feature_xray _validate_xray_config || return 1; fi
+    if [ "$changed_sb" = 1 ]; then _manage_service restart || return 1; fi
+    if [ "$changed_xray" = 1 ]; then _feature_xray _manage_xray_service restart || return 1; fi
     committed=1
 )
 
@@ -234,6 +235,7 @@ _argo_refresh_artifacts() {
     if [ "$transport" = ws ]; then path=$(_ws_path_with_early_data "$path"); fi
     link+="&path=$(_url_encode "$path")"
     [ "$transport" != xhttp ] || link+="&mode=packet-up"
+    [ "$transport" != httpupgrade ] || link+="&alpn=http%2F1.1"
     link+="#$(_url_encode "$name")"
     _atomic_modify_json "$ARGO_METADATA_FILE" '.[$t].share_link = $link' --arg t "$tag" --arg link "$link" || return 1
     if [ "$transport" = xhttp ]; then return 0; fi
@@ -251,10 +253,21 @@ _argo_refresh_artifacts() {
     else _add_node_to_yaml "$proxy"; fi
 }
 
+_build_argo_xray_inbound() {
+    local tag="$1" protocol="$2" transport="$3" port="$4" credential="$5" path="$6"
+    case "$transport" in httpupgrade|xhttp) ;; *) return 1 ;; esac
+    jq -n --arg t "$tag" --arg p "$protocol" --arg net "$transport" --argjson port "$port" --arg c "$credential" --arg path "$path" '
+        {tag:$t,listen:"127.0.0.1",port:$port,protocol:$p,
+         settings:({clients:[if $p == "vless" then {id:$c} else {password:$c} end]} + (if $p == "vless" then {decryption:"none"} else {} end)),
+         streamSettings:({network:$net,security:"none"} +
+            (if $net == "httpupgrade" then {httpupgradeSettings:{path:$path}}
+             else {xhttpSettings:{path:$path,mode:"packet-up"}} end))}'
+}
+
 _create_argo_node() {
     local protocol="$1" transport="${2:-ws}" core=singbox port path credential custom_password mode token="" domain="" name tag inbound meta
-    case "$protocol:$transport" in vless:ws|trojan:ws|vless:httpupgrade|trojan:httpupgrade) ;; vless:xhttp|trojan:xhttp) core=xray ;; *) return 1 ;; esac
-    [ "$core" != xray ] || [ -x "$FEATURE_XRAY_BIN" ] || { _error "XHTTP 需要先安装 Xray 核心。"; return 1; }
+    case "$protocol:$transport" in vless:ws|trojan:ws) ;; vless:xhttp|trojan:xhttp|vless:httpupgrade|trojan:httpupgrade) core=xray ;; *) return 1 ;; esac
+    [ "$core" != xray ] || [ -x "$FEATURE_XRAY_BIN" ] || { _error "${transport} 需要先通过主菜单 [16] 安装 Xray 核心。"; return 1; }
     _install_cloudflared || return 1
     read -r -p "Argo 本地端口 (回车随机): " port
     [ -n "$port" ] || port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 40000 + 20000 ))
@@ -299,10 +312,7 @@ _create_argo_node() {
         _check_combined_config_files && _manage_service restart || return 1
     else
         _feature_xray _init_xray_config && _feature_xray _create_xray_service || return 1
-        inbound=$(jq -n --arg t "$tag" --arg p "$protocol" --argjson port "$port" --arg c "$credential" --arg path "$path" '
-            {tag:$t,listen:"127.0.0.1",port:$port,protocol:$p,
-             settings:({clients:[if $p == "vless" then {id:$c} else {password:$c} end]} + if $p == "vless" then {decryption:"none"} else {} end),
-             streamSettings:{network:"xhttp",security:"none",xhttpSettings:{path:$path,mode:"packet-up"}}}') || return 1
+        inbound=$(_build_argo_xray_inbound "$tag" "$protocol" "$transport" "$port" "$credential" "$path") || return 1
         _atomic_modify_json "$FEATURE_XRAY_CONFIG" '.inbounds += [$in]' --argjson in "$inbound" || return 1
         # 后安装的核心也继承既有统一出口。
         if [ -f "${SINGBOX_DIR}/egress.json" ]; then _apply_socks_egress "$(jq -c '.outbound' "${SINGBOX_DIR}/egress.json")" || return 1; fi
@@ -323,6 +333,48 @@ _create_argo_node() {
 }
 
 _add_argo_node() { _feature_transaction _create_argo_node "$@"; }
+
+_repair_argo_httpupgrade_locked() {
+    local entry tag node protocol credential path port inbound existing
+    _feature_xray _init_xray_config && _feature_xray _create_xray_service || return 1
+    while IFS= read -r entry; do
+        tag=$(jq -r .key <<< "$entry")
+        protocol=$(jq -r '.value.protocol | split("-")[0]' <<< "$entry")
+        if [ "$(jq -r '.value.core // "singbox"' <<< "$entry")" != xray ]; then
+            node=$(jq -ce --arg t "$tag" '.inbounds[]? | select(.tag == $t)' "$CONFIG_FILE") || {
+                _error "找不到旧 HTTPUpgrade 入站 $tag，未修改配置。"; return 1;
+            }
+            jq -e --arg p "$protocol" '.type == $p and .transport.type == "httpupgrade" and (.users|length) == 1' <<< "$node" >/dev/null || {
+                _error "HTTPUpgrade 节点 $tag 的协议或用户配置不符合预期，未迁移。"; return 1;
+            }
+            credential=$(jq -r '.users[0].uuid // .users[0].password // empty' <<< "$node")
+            path=$(jq -r '.transport.path // "/"' <<< "$node")
+            port=$(jq -r .listen_port <<< "$node")
+            [ -n "$credential" ] || return 1
+            existing=$(jq --arg t "$tag" --argjson p "$port" '[.inbounds[]? | select(.tag == $t or .port == $p)] | length' "$FEATURE_XRAY_CONFIG") || return 1
+            [ "$existing" = 0 ] || { _error "Xray 中存在相同标签或端口 $port，未迁移。"; return 1; }
+            inbound=$(_build_argo_xray_inbound "$tag" "$protocol" httpupgrade "$port" "$credential" "$path") || return 1
+            _atomic_modify_json "$FEATURE_XRAY_CONFIG" '.inbounds += [$in]' --argjson in "$inbound" || return 1
+            feature_port_handoff=1
+            _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $t))' --arg t "$tag" || return 1
+            _atomic_modify_json "$ARGO_METADATA_FILE" '
+                .[$t].core="xray" | .[$t].local_port=$p | .[$t].path=$path
+                | if $proto == "vless" then .[$t].uuid=$c else .[$t].password=$c end
+            ' --arg t "$tag" --argjson p "$port" --arg path "$path" --arg proto "$protocol" --arg c "$credential" || return 1
+        fi
+        _argo_refresh_artifacts "$tag" || return 1
+    done < <(jq -c 'to_entries[] | select(.value.protocol == "vless-httpupgrade" or .value.protocol == "trojan-httpupgrade")' "$ARGO_METADATA_FILE")
+    if [ -f "${SINGBOX_DIR}/egress.json" ]; then _apply_socks_egress "$(jq -c .outbound "${SINGBOX_DIR}/egress.json")" || return 1; fi
+}
+
+_repair_argo_httpupgrade() {
+    [ -f "$ARGO_METADATA_FILE" ] || return 0
+    if ! jq -e 'any(.[]; (.protocol == "vless-httpupgrade" or .protocol == "trojan-httpupgrade") and
+        ((.core // "singbox") != "xray" or ((.share_link // "") | contains("alpn=http%2F1.1") | not)))' "$ARGO_METADATA_FILE" >/dev/null; then return 0; fi
+    [ -x "$FEATURE_XRAY_BIN" ] || { _warn "旧 HTTPUpgrade 节点需要 Xray 兼容握手，请先在主菜单 [16] 安装 Xray；原配置已保留。"; return 1; }
+    _feature_transaction _repair_argo_httpupgrade_locked || return 1
+    _success "HTTPUpgrade 节点已修复，端口、凭据、路径和域名已保留；请重新导入分享链接或刷新订阅。"
+}
 
 _sync_argo_ws_artifacts() {
     local tag
@@ -433,7 +485,9 @@ _subscription_clash_nodes() {
         + (if $p.network == "ws" then {transport:{type:"ws",path:($p["ws-opts"].path // "/"),headers:($p["ws-opts"].headers // {})}}
            elif $p.network == "grpc" then {transport:{type:"grpc",service_name:($p["grpc-opts"]["grpc-service-name"] // "")}}
            elif $p.network == "httpupgrade" then {transport:{type:"httpupgrade",path:($p["http-upgrade-opts"].path // "/"),host:($p["http-upgrade-opts"].host // $p.server)}} else {} end)
-        + (if $t == "hysteria2" and $p.obfs then {obfs:{type:$p.obfs,password:$p["obfs-password"]}} else {} end)),share_link:""}'
+        + (if $t == "hysteria2" and $p.obfs then {obfs:{type:$p.obfs,password:$p["obfs-password"]}} else {} end))}
+        | if .outbound.transport.type == "httpupgrade" and .outbound.tls.enabled == true then .outbound.tls.alpn=["http/1.1"] else . end
+        | .share_link=""'
 }
 
 _subscription_fetch() (
